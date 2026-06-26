@@ -11,22 +11,22 @@ from datetime import datetime, timezone
 from filters import FILTERS
 from state import SeenTokens, VolumeHistory
 from discord_client import send_gem_alert, send_narrative_update, send_spike_alert
+from funding_monitor import scan_funding
+from liquidation_monitor import run_liquidation_monitor
 
 DEXSCREENER_BASE = "https://api.dexscreener.com"
 
 SCAN_INTERVAL_SECONDS = 120
 NARRATIVE_INTERVAL_SECONDS = 7200
 WATCHLIST_SCAN_INTERVAL_SECONDS = 60
+FUNDING_SCAN_INTERVAL_SECONDS = 1800
+
 REQUEST_DELAY = 1.0
 
 seen = SeenTokens(ttl_seconds=FILTERS["dedup_ttl_seconds"])
 vol_history = VolumeHistory(ttl_seconds=3600)
 
-# Watchlist: top N tokens by liquidity, refreshed each main scan
-# address -> pair data snapshot
 watchlist: dict[str, dict] = {}
-
-# Dedup for spike alerts — don't re-alert same token within 10 min
 seen_spikes = SeenTokens(ttl_seconds=600)
 
 
@@ -67,7 +67,6 @@ def passes_filters(pair: dict, age_hours: float) -> tuple[bool, str]:
     ch_h1 = (pair.get("priceChange") or {}).get("h1") or 0
     mcap = pair.get("marketCap") or pair.get("fdv") or 0
 
-    # Base filters
     if liq < FILTERS["min_liquidity_usd"]:
         return False, f"liq_low ${liq:,.0f}"
     if liq > FILTERS["max_liquidity_usd"]:
@@ -81,11 +80,9 @@ def passes_filters(pair: dict, age_hours: float) -> tuple[bool, str]:
     if ch_h1 < FILTERS["min_price_change_h1"]:
         return False, f"no_momentum {ch_h1:.1f}%"
 
-    # Honeypot: many buys but zero sells = can't sell
     if buys >= FILTERS["honeypot_min_buys_threshold"] and sells == 0:
         return False, f"honeypot {buys} buys / 0 sells"
 
-    # Anti-rug: buy/sell ratio
     if total_txns > 0:
         buy_ratio = buys / total_txns
         if buy_ratio > FILTERS["max_buy_ratio"]:
@@ -93,7 +90,6 @@ def passes_filters(pair: dict, age_hours: float) -> tuple[bool, str]:
         if buy_ratio < FILTERS["min_buy_ratio"]:
             return False, f"dump {buy_ratio:.0%} buys"
 
-    # Anti-rug: liquidity vs mcap
     if mcap > 0:
         liq_ratio = liq / mcap
         if liq_ratio < FILTERS["min_liq_to_mcap_ratio"]:
@@ -152,9 +148,9 @@ async def process_profile(
     created_at = pair.get("pairCreatedAt")
     age_hours = (time.time() - created_at / 1000) / 3600 if created_at else 999
 
-    # Approach B — inline spike check on new tokens
     if has_inline_spike(pair) and not seen_spikes.has(addr):
-        print(f"[spike-B] Inline spike detected for {pair.get('baseToken', {}).get('symbol', '?')}")
+        symbol = pair.get("baseToken", {}).get("symbol", "?")
+        print(f"[spike-B] Inline spike detected for {symbol}")
         await send_spike_alert(session, pair, spike_type="inline")
         seen_spikes.add(addr)
 
@@ -166,11 +162,9 @@ async def process_profile(
         seen.add(addr)
         return
 
-    # Add to watchlist for ongoing monitoring
     liq = (pair.get("liquidity") or {}).get("usd") or 0
     if liq >= FILTERS["spike_min_liquidity"]:
         watchlist[addr] = pair
-        # Trim watchlist to top N by liquidity
         if len(watchlist) > FILTERS["watchlist_size"]:
             sorted_wl = sorted(
                 watchlist.items(),
@@ -258,12 +252,10 @@ async def scan_watchlist(session: aiohttp.ClientSession):
         vol_h1 = (pair.get("volume") or {}).get("h1") or 0
         liq = (pair.get("liquidity") or {}).get("usd") or 0
 
-        # Skip if liquidity dropped below minimum (possible rug)
         if liq < FILTERS["spike_min_liquidity"]:
             watchlist.pop(addr, None)
             continue
 
-        # Skip if vol.m5 too small to be meaningful
         if vol_m5 < FILTERS["spike_min_vol_m5"]:
             vol_history.set(addr, vol_m5, vol_h1)
             continue
@@ -286,7 +278,6 @@ async def scan_watchlist(session: aiohttp.ClientSession):
                     seen_spikes.add(addr)
                     spikes_found += 1
 
-        # Update snapshot
         vol_history.set(addr, vol_m5, vol_h1)
 
     vol_history.cleanup()
@@ -312,44 +303,64 @@ async def scan_narratives(session: aiohttp.ClientSession):
     print(f"[narratives] Sent {min(5, len(sorted_metas))} narratives")
 
 
+async def main_loop(session: aiohttp.ClientSession):
+    """Main polling loop — tokens, watchlist, funding, narratives."""
+    last_narrative = 0
+    last_watchlist = 0
+    last_funding = 0
+
+    while True:
+        try:
+            await scan_tokens(session)
+
+            if time.time() - last_watchlist >= WATCHLIST_SCAN_INTERVAL_SECONDS:
+                await scan_watchlist(session)
+                last_watchlist = time.time()
+
+            if time.time() - last_funding >= FUNDING_SCAN_INTERVAL_SECONDS:
+                await scan_funding(session)
+                last_funding = time.time()
+
+            if time.time() - last_narrative >= NARRATIVE_INTERVAL_SECONDS:
+                await scan_narratives(session)
+                last_narrative = time.time()
+
+        except Exception as e:
+            print(f"[main] Unexpected error: {e}")
+
+        print(f"[main] Waiting {SCAN_INTERVAL_SECONDS}s...\n")
+        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+
+
 async def main():
     print("=" * 50)
     print("Trench Scanner — starting")
     print(f"Chain: {FILTERS['chain_id']}")
     print(f"Scan interval: {SCAN_INTERVAL_SECONDS}s")
     print(f"Watchlist interval: {WATCHLIST_SCAN_INTERVAL_SECONDS}s")
+    print(f"Funding interval: {FUNDING_SCAN_INTERVAL_SECONDS}s")
+    print(f"Liquidations: WebSocket (real-time)")
     print("=" * 50)
 
-    required = ["DISCORD_WEBHOOK_GEMS", "DISCORD_WEBHOOK_NARRATIVES", "DISCORD_WEBHOOK_SPIKES"]
+    required = [
+        "DISCORD_WEBHOOK_GEMS",
+        "DISCORD_WEBHOOK_NARRATIVES",
+        "DISCORD_WEBHOOK_SPIKES",
+        "DISCORD_WEBHOOK_FUNDING",
+        "DISCORD_WEBHOOK_LIQUIDATIONS",
+    ]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:
         raise EnvironmentError(f"Missing environment variables: {missing}")
 
-    last_narrative = 0
-    last_watchlist = 0
-
     async with aiohttp.ClientSession(
         headers={"User-Agent": "TrenchScanner/1.0"}
     ) as session:
-        while True:
-            try:
-                await scan_tokens(session)
-
-                # Watchlist scan every 60s
-                if time.time() - last_watchlist >= WATCHLIST_SCAN_INTERVAL_SECONDS:
-                    await scan_watchlist(session)
-                    last_watchlist = time.time()
-
-                # Narratives every 2h
-                if time.time() - last_narrative >= NARRATIVE_INTERVAL_SECONDS:
-                    await scan_narratives(session)
-                    last_narrative = time.time()
-
-            except Exception as e:
-                print(f"[main] Unexpected error: {e}")
-
-            print(f"[main] Waiting {SCAN_INTERVAL_SECONDS}s...\n")
-            await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        # Run main loop and liquidation monitor concurrently
+        await asyncio.gather(
+            main_loop(session),
+            run_liquidation_monitor(session),
+        )
 
 
 if __name__ == "__main__":

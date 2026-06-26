@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 WEBHOOK_GEMS = os.environ["DISCORD_WEBHOOK_GEMS"]
 WEBHOOK_NARRATIVES = os.environ["DISCORD_WEBHOOK_NARRATIVES"]
 WEBHOOK_SPIKES = os.environ["DISCORD_WEBHOOK_SPIKES"]
+WEBHOOK_FUNDING = os.environ["DISCORD_WEBHOOK_FUNDING"]
+WEBHOOK_LIQUIDATIONS = os.environ["DISCORD_WEBHOOK_LIQUIDATIONS"]
 
 
 def _fmt_usd(value: float) -> str:
@@ -125,10 +127,6 @@ async def send_spike_alert(
     spike_type: str,
     prev_vol_m5: float | None = None,
 ):
-    """
-    spike_type: "watchlist" (A) or "inline" (B)
-    prev_vol_m5: previous snapshot value, only for watchlist spikes
-    """
     symbol = pair.get("baseToken", {}).get("symbol", "???").lstrip("$")
     name = pair.get("baseToken", {}).get("name", symbol)
     addr = pair.get("baseToken", {}).get("address", "")
@@ -150,7 +148,6 @@ async def send_spike_alert(
     dex_url = pair.get("url", "")
     info = pair.get("info") or {}
 
-    # Spike multiplier for watchlist type
     if spike_type == "watchlist" and prev_vol_m5 and prev_vol_m5 > 0:
         multiplier = vol_m5 / prev_vol_m5
         spike_label = f"⚡ Watchlist spike — {multiplier:.1f}x vol surge"
@@ -171,29 +168,17 @@ async def send_spike_alert(
             "color": 0xFFFF00,
             "fields": [
                 {"name": "📋 CA", "value": f"`{addr}`", "inline": False},
-
-                # Spike detail
                 {"name": "📊 Spike detail", "value": spike_detail, "inline": False},
-
-                # Price & market
                 {"name": "💵 Price", "value": f"${price}", "inline": True},
                 {"name": "📦 MCap", "value": _fmt_usd(mcap), "inline": True},
                 {"name": "💧 Liquidity", "value": _fmt_usd(liq), "inline": True},
-
-                # Volume breakdown
                 {"name": "⚡ Vol 5m", "value": _fmt_usd(vol_m5), "inline": True},
                 {"name": "📊 Vol 1h", "value": _fmt_usd(vol_h1), "inline": True},
                 {"name": "📊 Vol 24h", "value": _fmt_usd(vol_h24), "inline": True},
-
-                # Price changes
                 {"name": "📈 5m", "value": f"{ch_m5:+.1f}%", "inline": True},
                 {"name": "📈 1h", "value": f"{ch_h1:+.1f}%", "inline": True},
-
-                # Txns
                 {"name": "🔄 Txns 5m", "value": f"{buys_m5}↑ {sells_m5}↓", "inline": True},
                 {"name": "🔄 Buy/Sell 24h", "value": _fmt_ratio(buys_h24, sells_h24), "inline": False},
-
-                # Socials
                 {"name": "🔗 Socials", "value": _fmt_socials(info), "inline": False},
             ],
             "footer": {"text": "Trench Scanner • Volume Spike"},
@@ -205,6 +190,151 @@ async def send_spike_alert(
         if resp.status not in (200, 204):
             text = await resp.text()
             print(f"[discord] Spike send error: {resp.status} {text}")
+        return resp.status
+
+
+async def send_funding_alert(session: aiohttp.ClientSession, data: dict):
+    coin = data["coin"]
+    funding = data["funding"]
+    annual_rate = data["annual_rate"]
+    oi_usd = data["oi_usd"]
+    oi_change_pct = data.get("oi_change_pct")
+    mark_px = data["mark_px"]
+    day_volume = data["day_volume"]
+    signal = data["signal"]
+    premium = data["premium"]
+
+    if signal == "high":
+        color = 0xFF0000
+        title = f"🔴 HIGH FUNDING — {coin}"
+        signal_desc = (
+            f"Overcrowded **LONG** — longs paying shorts\n"
+            f"Rate: **{funding:.4%}/h** ({annual_rate:.1f}% APR)\n"
+            f"Potential short squeeze setup"
+        )
+    elif signal == "low":
+        color = 0x00AAFF
+        title = f"🔵 NEGATIVE FUNDING — {coin}"
+        signal_desc = (
+            f"Overcrowded **SHORT** — shorts paying longs\n"
+            f"Rate: **{funding:.4%}/h** ({annual_rate:.1f}% APR)\n"
+            f"Potential long squeeze setup"
+        )
+    else:
+        color = 0xFFAA00
+        title = f"⚠️ OI SPIKE — {coin}"
+        direction = "↑" if (oi_change_pct or 0) > 0 else "↓"
+        pct_str = f"{abs(oi_change_pct or 0):.1%}"
+        signal_desc = (
+            f"Open Interest moved **{direction}{pct_str}** since last scan\n"
+            f"Current funding: **{funding:.4%}/h** ({annual_rate:.1f}% APR)\n"
+            f"Large positions opening now"
+        )
+
+    def _funding_bar(rate: float) -> str:
+        clamped = max(-0.001, min(0.001, rate))
+        normalized = (clamped + 0.001) / 0.002
+        filled = round(normalized * 10)
+        return "🟥" * filled + "🟦" * (10 - filled) + f"  {rate:+.4%}/h"
+
+    oi_change_str = (
+        f"{oi_change_pct:+.1%} since last scan"
+        if oi_change_pct is not None
+        else "First snapshot"
+    )
+
+    embed = {
+        "embeds": [{
+            "title": title,
+            "description": signal_desc,
+            "color": color,
+            "fields": [
+                {"name": "📊 Funding rate", "value": _funding_bar(funding), "inline": False},
+                {"name": "💵 Mark price", "value": f"${mark_px:,.4f}", "inline": True},
+                {"name": "📦 Open Interest", "value": _fmt_usd(oi_usd), "inline": True},
+                {"name": "📈 OI change", "value": oi_change_str, "inline": True},
+                {"name": "📊 24h Volume", "value": _fmt_usd(day_volume), "inline": True},
+                {"name": "📉 Premium", "value": f"{premium:+.4%}", "inline": True},
+                {
+                    "name": "🔗 Trade",
+                    "value": f"[Hyperliquid](https://app.hyperliquid.xyz/trade/{coin})",
+                    "inline": True
+                },
+            ],
+            "footer": {"text": "Trench Scanner • Hyperliquid Funding"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }]
+    }
+
+    async with session.post(WEBHOOK_FUNDING, json=embed) as resp:
+        if resp.status not in (200, 204):
+            text = await resp.text()
+            print(f"[discord] Funding alert error: {resp.status} {text}")
+        return resp.status
+
+
+async def send_liquidation_alert(session: aiohttp.ClientSession, data: dict):
+    """Send liquidation or large trade alert to #liquidations channel."""
+    coin = data["coin"]
+    side = data["side"]
+    price = data["price"]
+    size = data["size"]
+    usd_value = data["usd_value"]
+    is_liquidation = data["is_liquidation"]
+
+    # Side: "B" = buy (long liquidation = forced sell), "A" = sell (short liq = forced buy)
+    if side == "A":
+        side_label = "SHORT liquidated 🔴"
+        side_emoji = "🔴"
+        color = 0xFF0000
+    else:
+        side_label = "LONG liquidated 🟢"
+        side_emoji = "🟢"
+        color = 0x00FF88
+
+    if is_liquidation:
+        title = f"💥 LIQUIDATION — {coin}"
+        event_type = "Liquidation"
+    else:
+        title = f"🐋 LARGE TRADE — {coin}"
+        event_type = "Large trade"
+
+    # Size label
+    if usd_value >= 1_000_000:
+        size_label = f"${usd_value/1_000_000:.2f}M"
+    else:
+        size_label = f"${usd_value/1_000:.0f}K"
+
+    embed = {
+        "embeds": [{
+            "title": title,
+            "description": (
+                f"{side_emoji} **{side_label}**\n"
+                f"Size: **{size_label}**\n"
+                f"[📊 Hyperliquid](https://app.hyperliquid.xyz/trade/{coin})"
+            ),
+            "color": color,
+            "fields": [
+                {"name": "💥 Type", "value": event_type, "inline": True},
+                {"name": "💵 Price", "value": f"${price:,.4f}", "inline": True},
+                {"name": "📦 Size", "value": f"{size:,.2f} {coin}", "inline": True},
+                {"name": "💰 USD Value", "value": size_label, "inline": True},
+                {"name": "📊 Side", "value": side_label, "inline": True},
+                {
+                    "name": "🔗 Chart",
+                    "value": f"[View on Hyperliquid](https://app.hyperliquid.xyz/trade/{coin})",
+                    "inline": True
+                },
+            ],
+            "footer": {"text": "Trench Scanner • Hyperliquid Liquidations"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }]
+    }
+
+    async with session.post(WEBHOOK_LIQUIDATIONS, json=embed) as resp:
+        if resp.status not in (200, 204):
+            text = await resp.text()
+            print(f"[discord] Liquidation alert error: {resp.status} {text}")
         return resp.status
 
 
