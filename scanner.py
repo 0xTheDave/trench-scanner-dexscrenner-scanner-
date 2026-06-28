@@ -13,6 +13,9 @@ from state import SeenTokens, VolumeHistory
 from discord_client import send_gem_alert, send_narrative_update, send_spike_alert
 from funding_monitor import scan_funding
 from liquidation_monitor import run_liquidation_monitor
+from boost_monitor import scan_boosts
+from community_takeover_monitor import scan_takeovers
+from jupiter_monitor import scan_jupiter
 
 DEXSCREENER_BASE = "https://api.dexscreener.com"
 
@@ -20,6 +23,9 @@ SCAN_INTERVAL_SECONDS = 120
 NARRATIVE_INTERVAL_SECONDS = 7200
 WATCHLIST_SCAN_INTERVAL_SECONDS = 60
 FUNDING_SCAN_INTERVAL_SECONDS = 1800
+BOOST_SCAN_INTERVAL_SECONDS = 300
+TAKEOVER_SCAN_INTERVAL_SECONDS = 300
+JUPITER_SCAN_INTERVAL_SECONDS = 300
 
 REQUEST_DELAY = 1.0
 
@@ -304,10 +310,13 @@ async def scan_narratives(session: aiohttp.ClientSession):
 
 
 async def main_loop(session: aiohttp.ClientSession):
-    """Main polling loop — tokens, watchlist, funding, narratives."""
+    """Main polling loop — all scanners except liquidations."""
     last_narrative = 0
     last_watchlist = 0
     last_funding = 0
+    last_boost = 0
+    last_takeover = 0
+    last_jupiter = 0
 
     while True:
         try:
@@ -320,6 +329,18 @@ async def main_loop(session: aiohttp.ClientSession):
             if time.time() - last_funding >= FUNDING_SCAN_INTERVAL_SECONDS:
                 await scan_funding(session)
                 last_funding = time.time()
+
+            if time.time() - last_boost >= BOOST_SCAN_INTERVAL_SECONDS:
+                await scan_boosts(session)
+                last_boost = time.time()
+
+            if time.time() - last_takeover >= TAKEOVER_SCAN_INTERVAL_SECONDS:
+                await scan_takeovers(session)
+                last_takeover = time.time()
+
+            if time.time() - last_jupiter >= JUPITER_SCAN_INTERVAL_SECONDS:
+                await scan_jupiter(session)
+                last_jupiter = time.time()
 
             if time.time() - last_narrative >= NARRATIVE_INTERVAL_SECONDS:
                 await scan_narratives(session)
@@ -339,6 +360,9 @@ async def main():
     print(f"Scan interval: {SCAN_INTERVAL_SECONDS}s")
     print(f"Watchlist interval: {WATCHLIST_SCAN_INTERVAL_SECONDS}s")
     print(f"Funding interval: {FUNDING_SCAN_INTERVAL_SECONDS}s")
+    print(f"Boost interval: {BOOST_SCAN_INTERVAL_SECONDS}s")
+    print(f"Takeover interval: {TAKEOVER_SCAN_INTERVAL_SECONDS}s")
+    print(f"Jupiter interval: {JUPITER_SCAN_INTERVAL_SECONDS}s")
     print(f"Liquidations: WebSocket (real-time)")
     print("=" * 50)
 
@@ -348,6 +372,9 @@ async def main():
         "DISCORD_WEBHOOK_SPIKES",
         "DISCORD_WEBHOOK_FUNDING",
         "DISCORD_WEBHOOK_LIQUIDATIONS",
+        "DISCORD_WEBHOOK_BOOSTED",
+        "DISCORD_WEBHOOK_TAKEOVERS",
+        "DISCORD_WEBHOOK_JUPITER",
     ]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:
@@ -356,7 +383,6 @@ async def main():
     async with aiohttp.ClientSession(
         headers={"User-Agent": "TrenchScanner/1.0"}
     ) as session:
-        # Run main loop and liquidation monitor concurrently
         await asyncio.gather(
             main_loop(session),
             run_liquidation_monitor(session),

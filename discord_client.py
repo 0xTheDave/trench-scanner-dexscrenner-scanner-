@@ -9,6 +9,9 @@ WEBHOOK_NARRATIVES = os.environ["DISCORD_WEBHOOK_NARRATIVES"]
 WEBHOOK_SPIKES = os.environ["DISCORD_WEBHOOK_SPIKES"]
 WEBHOOK_FUNDING = os.environ["DISCORD_WEBHOOK_FUNDING"]
 WEBHOOK_LIQUIDATIONS = os.environ["DISCORD_WEBHOOK_LIQUIDATIONS"]
+WEBHOOK_BOOSTED = os.environ["DISCORD_WEBHOOK_BOOSTED"]
+WEBHOOK_TAKEOVERS = os.environ["DISCORD_WEBHOOK_TAKEOVERS"]
+WEBHOOK_JUPITER = os.environ["DISCORD_WEBHOOK_JUPITER"]
 
 
 def _fmt_usd(value: float) -> str:
@@ -44,6 +47,18 @@ def _fmt_socials(info: dict) -> str:
         url = site.get("url", "")
         if url:
             parts.append(f"[Web]({url})")
+    return " · ".join(parts) if parts else "None"
+
+
+def _fmt_boost_links(links: list) -> str:
+    if not links:
+        return "None"
+    parts = []
+    for link in links:
+        label = link.get("label") or link.get("type", "Link")
+        url = link.get("url", "")
+        if url:
+            parts.append(f"[{label}]({url})")
     return " · ".join(parts) if parts else "None"
 
 
@@ -274,7 +289,6 @@ async def send_funding_alert(session: aiohttp.ClientSession, data: dict):
 
 
 async def send_liquidation_alert(session: aiohttp.ClientSession, data: dict):
-    """Send liquidation or large trade alert to #liquidations channel."""
     coin = data["coin"]
     side = data["side"]
     price = data["price"]
@@ -282,14 +296,11 @@ async def send_liquidation_alert(session: aiohttp.ClientSession, data: dict):
     usd_value = data["usd_value"]
     is_liquidation = data["is_liquidation"]
 
-    # Side: "B" = buy (long liquidation = forced sell), "A" = sell (short liq = forced buy)
     if side == "A":
         side_label = "SHORT liquidated 🔴"
-        side_emoji = "🔴"
         color = 0xFF0000
     else:
         side_label = "LONG liquidated 🟢"
-        side_emoji = "🟢"
         color = 0x00FF88
 
     if is_liquidation:
@@ -299,7 +310,6 @@ async def send_liquidation_alert(session: aiohttp.ClientSession, data: dict):
         title = f"🐋 LARGE TRADE — {coin}"
         event_type = "Large trade"
 
-    # Size label
     if usd_value >= 1_000_000:
         size_label = f"${usd_value/1_000_000:.2f}M"
     else:
@@ -309,7 +319,7 @@ async def send_liquidation_alert(session: aiohttp.ClientSession, data: dict):
         "embeds": [{
             "title": title,
             "description": (
-                f"{side_emoji} **{side_label}**\n"
+                f"{'🔴' if side == 'A' else '🟢'} **{side_label}**\n"
                 f"Size: **{size_label}**\n"
                 f"[📊 Hyperliquid](https://app.hyperliquid.xyz/trade/{coin})"
             ),
@@ -335,6 +345,248 @@ async def send_liquidation_alert(session: aiohttp.ClientSession, data: dict):
         if resp.status not in (200, 204):
             text = await resp.text()
             print(f"[discord] Liquidation alert error: {resp.status} {text}")
+        return resp.status
+
+
+async def send_boost_alert(session: aiohttp.ClientSession, token_data: dict):
+    boost = token_data["boost"]
+    pair = token_data.get("pair")
+
+    addr = boost.get("tokenAddress", "")
+    dex_url = boost.get("url", "")
+    amount = boost.get("amount", 0) or 0
+    total_amount = boost.get("totalAmount", 0) or 0
+    description = boost.get("description", "") or ""
+    links = boost.get("links") or []
+    source = boost.get("source", "latest")
+
+    if pair:
+        symbol = pair.get("baseToken", {}).get("symbol", "???").lstrip("$")
+        name = pair.get("baseToken", {}).get("name", symbol)
+        price = pair.get("priceUsd") or "N/A"
+        liq = (pair.get("liquidity") or {}).get("usd") or 0
+        vol_h24 = (pair.get("volume") or {}).get("h24") or 0
+        mcap = pair.get("marketCap") or pair.get("fdv") or 0
+        ch_h1 = (pair.get("priceChange") or {}).get("h1") or 0
+        ch_h24 = (pair.get("priceChange") or {}).get("h24") or 0
+        txns = (pair.get("txns") or {}).get("h24") or {}
+        buys = txns.get("buys", 0)
+        sells = txns.get("sells", 0)
+    else:
+        symbol = addr[:8] + "..."
+        name = "Unknown"
+        price = "N/A"
+        liq = mcap = vol_h24 = ch_h1 = ch_h24 = buys = sells = 0
+
+    if total_amount >= 500:
+        tier = "🔥🔥🔥 MEGA BOOST"
+        color = 0xFF0000
+    elif total_amount >= 200:
+        tier = "🔥🔥 HEAVY BOOST"
+        color = 0xFF6600
+    elif total_amount >= 50:
+        tier = "🔥 BOOSTED"
+        color = 0xFFAA00
+    else:
+        tier = "⚡ NEW BOOST"
+        color = 0xFFFF00
+
+    source_label = "🆕 New boost" if source == "latest" else "🏆 Top boosted"
+    desc_display = (description[:200] + "...") if len(description) > 200 else description
+
+    fields = [{"name": "📋 CA", "value": f"`{addr}`", "inline": False}]
+
+    if desc_display:
+        fields.append({"name": "📝 Description", "value": desc_display, "inline": False})
+
+    fields += [
+        {"name": "⚡ New boosts", "value": str(amount), "inline": True},
+        {"name": "🔥 Total boosts", "value": str(total_amount), "inline": True},
+        {"name": "📊 Source", "value": source_label, "inline": True},
+    ]
+
+    if pair:
+        fields += [
+            {"name": "💵 Price", "value": f"${price}", "inline": True},
+            {"name": "📦 MCap", "value": _fmt_usd(mcap), "inline": True},
+            {"name": "💧 Liquidity", "value": _fmt_usd(liq), "inline": True},
+            {"name": "📊 Vol 24h", "value": _fmt_usd(vol_h24), "inline": True},
+            {"name": "📈 1h", "value": f"{ch_h1:+.1f}%", "inline": True},
+            {"name": "📈 24h", "value": f"{ch_h24:+.1f}%", "inline": True},
+            {"name": "🔄 Buy/Sell 24h", "value": _fmt_ratio(buys, sells), "inline": False},
+        ]
+
+    boost_links = _fmt_boost_links(links)
+    if boost_links != "None":
+        fields.append({"name": "🔗 Links", "value": boost_links, "inline": False})
+
+    embed = {
+        "embeds": [{
+            "title": f"🚀 {tier} — ${symbol}",
+            "description": f"**{name}**\n[📊 DexScreener]({dex_url})",
+            "color": color,
+            "fields": fields,
+            "footer": {"text": "Trench Scanner • DexScreener Boosts"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }]
+    }
+
+    async with session.post(WEBHOOK_BOOSTED, json=embed) as resp:
+        if resp.status not in (200, 204):
+            text = await resp.text()
+            print(f"[discord] Boost alert error: {resp.status} {text}")
+        return resp.status
+
+
+async def send_takeover_alert(session: aiohttp.ClientSession, token_data: dict):
+    """Send community takeover alert."""
+    takeover = token_data["takeover"]
+    pair = token_data.get("pair")
+
+    addr = takeover.get("tokenAddress", "")
+    dex_url = takeover.get("url", "")
+    description = takeover.get("description", "") or ""
+    claim_date = takeover.get("claimDate", "") or ""
+    links = takeover.get("links") or []
+
+    if pair:
+        symbol = pair.get("baseToken", {}).get("symbol", "???").lstrip("$")
+        name = pair.get("baseToken", {}).get("name", symbol)
+        price = pair.get("priceUsd") or "N/A"
+        liq = (pair.get("liquidity") or {}).get("usd") or 0
+        vol_h24 = (pair.get("volume") or {}).get("h24") or 0
+        mcap = pair.get("marketCap") or pair.get("fdv") or 0
+        ch_h1 = (pair.get("priceChange") or {}).get("h1") or 0
+        ch_h24 = (pair.get("priceChange") or {}).get("h24") or 0
+        txns = (pair.get("txns") or {}).get("h24") or {}
+        buys = txns.get("buys", 0)
+        sells = txns.get("sells", 0)
+    else:
+        symbol = addr[:8] + "..."
+        name = "Unknown"
+        price = "N/A"
+        liq = mcap = vol_h24 = ch_h1 = ch_h24 = buys = sells = 0
+
+    claim_str = claim_date[:10] if len(claim_date) >= 10 else "Unknown"
+    desc_display = (description[:200] + "...") if len(description) > 200 else description
+
+    fields = [
+        {"name": "📋 CA", "value": f"`{addr}`", "inline": False},
+        {"name": "📅 Claimed", "value": claim_str, "inline": True},
+    ]
+
+    if desc_display:
+        fields.append({"name": "📝 Description", "value": desc_display, "inline": False})
+
+    if pair:
+        fields += [
+            {"name": "💵 Price", "value": f"${price}", "inline": True},
+            {"name": "📦 MCap", "value": _fmt_usd(mcap), "inline": True},
+            {"name": "💧 Liquidity", "value": _fmt_usd(liq), "inline": True},
+            {"name": "📊 Vol 24h", "value": _fmt_usd(vol_h24), "inline": True},
+            {"name": "📈 1h", "value": f"{ch_h1:+.1f}%", "inline": True},
+            {"name": "📈 24h", "value": f"{ch_h24:+.1f}%", "inline": True},
+            {"name": "🔄 Buy/Sell 24h", "value": _fmt_ratio(buys, sells), "inline": False},
+        ]
+
+    takeover_links = _fmt_boost_links(links)
+    if takeover_links != "None":
+        fields.append({"name": "🔗 Links", "value": takeover_links, "inline": False})
+
+    embed = {
+        "embeds": [{
+            "title": f"🏴 COMMUNITY TAKEOVER — ${symbol}",
+            "description": (
+                f"**{name}**\n"
+                f"Community claimed this project\n"
+                f"[📊 DexScreener]({dex_url})"
+            ),
+            "color": 0x9B59B6,
+            "fields": fields,
+            "footer": {"text": "Trench Scanner • DexScreener Takeovers"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }]
+    }
+
+    async with session.post(WEBHOOK_TAKEOVERS, json=embed) as resp:
+        if resp.status not in (200, 204):
+            text = await resp.text()
+            print(f"[discord] Takeover alert error: {resp.status} {text}")
+        return resp.status
+
+
+async def send_jupiter_alert(session: aiohttp.ClientSession, token_data: dict):
+    """Send Jupiter high-volume token alert."""
+    token = token_data["token"]
+    price_data = token_data.get("price_data")
+    daily_volume = token_data.get("daily_volume", 0)
+
+    symbol = (token.get("symbol") or "???").lstrip("$")
+    name = token.get("name") or symbol
+    addr = token.get("address") or ""
+    created_at = token.get("created_at") or ""
+
+    # Price from Jupiter price API
+    if price_data:
+        price = price_data.get("price") or "N/A"
+        confidence = price_data.get("extraInfo", {}).get("confidenceLevel") or "unknown"
+        price_str = f"${float(price):,.6f}" if price != "N/A" else "N/A"
+    else:
+        price_str = "N/A"
+        confidence = "unknown"
+
+    # Token metadata
+    tags = token.get("tags") or []
+    tags_str = ", ".join(tags[:5]) if tags else "None"
+
+    # Volume tier label
+    if daily_volume >= 1_000_000:
+        tier = "🔥🔥🔥 MEGA VOLUME"
+        color = 0xFF0000
+    elif daily_volume >= 500_000:
+        tier = "🔥🔥 HIGH VOLUME"
+        color = 0xFF6600
+    else:
+        tier = "🔥 ACTIVE TOKEN"
+        color = 0xFFAA00
+
+    fields = [
+        {"name": "📋 CA", "value": f"`{addr}`", "inline": False},
+        {"name": "💵 Price", "value": price_str, "inline": True},
+        {"name": "📊 Jupiter Vol 24h", "value": _fmt_usd(daily_volume), "inline": True},
+        {"name": "🎯 Confidence", "value": confidence, "inline": True},
+    ]
+
+    if tags_str != "None":
+        fields.append({"name": "🏷️ Tags", "value": tags_str, "inline": False})
+
+    if created_at:
+        fields.append({"name": "📅 Listed", "value": created_at[:10], "inline": True})
+
+    fields.append({
+        "name": "🔗 Trade",
+        "value": f"[Jupiter](https://jup.ag/swap/SOL-{addr})",
+        "inline": True
+    })
+
+    embed = {
+        "embeds": [{
+            "title": f"🪐 {tier} — ${symbol}",
+            "description": (
+                f"**{name}**\n"
+                f"High routing volume through Jupiter aggregator"
+            ),
+            "color": color,
+            "fields": fields,
+            "footer": {"text": "Trench Scanner • Jupiter API"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }]
+    }
+
+    async with session.post(WEBHOOK_JUPITER, json=embed) as resp:
+        if resp.status not in (200, 204):
+            text = await resp.text()
+            print(f"[discord] Jupiter alert error: {resp.status} {text}")
         return resp.status
 
 
