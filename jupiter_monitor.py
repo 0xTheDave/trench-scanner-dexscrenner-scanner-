@@ -11,14 +11,15 @@ from discord_client import send_jupiter_alert
 JUPITER_BASE = "https://lite-api.jup.ag"
 JUPITER_API_KEY = os.environ.get("JUPITER_API_KEY", "")
 
-SCAN_INTERVAL_SECONDS = 300         # every 5 minutes
-DEDUP_TTL = 3600                    # don't re-alert same token within 1h
-TARGET_CHAIN = "solana"
-
-# Minimum 24h volume through Jupiter to be worth alerting
-MIN_JUPITER_VOLUME = 50_000
+DEDUP_TTL = 86_400                  # don't re-alert same token within 24h
+MIN_JUPITER_VOLUME = 50_000         # minimum 24h routing volume
 
 alerted_jupiter: dict[str, float] = {}
+
+# Track previous top-20 set — alert only on NEW entrants
+previous_top: set[str] = set()
+
+EXCLUDED_SYMBOLS = ("USDC", "USDT", "SOL", "WSOL", "WETH", "BTC", "WBTC", "JUP")
 
 
 def _is_deduped(address: str) -> bool:
@@ -77,24 +78,24 @@ async def fetch_token_price(
     address: str,
 ) -> dict | None:
     """
-    Fetch price data for a single token from Jupiter price API.
-    Returns price object with vsToken price, confidence, etc.
+    Fetch price data for a single token from Jupiter Price API v3.
+    v3 response is keyed by address directly: {address: {usdPrice, ...}}
     """
     data = await fetch_json(
         session,
-        f"{JUPITER_BASE}/price/v3?ids={address}&showExtraInfo=true"
+        f"{JUPITER_BASE}/price/v3?ids={address}"
     )
     if not data:
         return None
 
-    prices = data.get("data", {})
-    return prices.get(address)
+    # v3 keys by address directly; fall back to v2-style data wrapper
+    entry = data.get(address) or (data.get("data") or {}).get(address)
+    return entry
 
 
 async def fetch_trending_tokens(session: aiohttp.ClientSession) -> list[dict]:
     """
-    Fetch trending/new tokens from Jupiter token search.
-    Uses /tokens/v2/search sorted by volume to find active tokens.
+    Fetch top tokens by volume from Jupiter token search.
     """
     data = await fetch_json(
         session,
@@ -109,9 +110,13 @@ async def fetch_trending_tokens(session: aiohttp.ClientSession) -> list[dict]:
 
 async def scan_jupiter(session: aiohttp.ClientSession):
     """
-    Scan Jupiter for trending tokens with high routing volume.
-    Alert on tokens with significant Jupiter swap activity.
+    Scan Jupiter top-20 volume tokens.
+    Alert only on NEW entrants to the top 20 — a token suddenly
+    appearing among the highest-volume tokens is the actual signal.
+    First run only records the baseline without alerting.
     """
+    global previous_top
+
     print(f"[jupiter] {datetime.now().strftime('%H:%M:%S')} — scanning Jupiter trending...")
 
     tokens = await fetch_trending_tokens(session)
@@ -120,18 +125,29 @@ async def scan_jupiter(session: aiohttp.ClientSession):
         print("[jupiter] No tokens received")
         return
 
-    print(f"[jupiter] Received {len(tokens)} tokens from Jupiter")
+    current_top = {t.get("address", "") for t in tokens if t.get("address")}
+    is_first_run = len(previous_top) == 0
+    new_entrants = current_top - previous_top
+
+    if is_first_run:
+        print(f"[jupiter] First run — baseline set with {len(current_top)} tokens, no alerts")
+        previous_top = current_top
+        return
+
+    print(f"[jupiter] Received {len(tokens)} tokens, new entrants: {len(new_entrants)}")
 
     alerts_sent = 0
 
     for token in tokens:
         addr = token.get("address", "")
-        if not addr or _is_deduped(addr):
+        if not addr or addr not in new_entrants:
             continue
 
-        # Skip non-Solana or stablecoins
+        if _is_deduped(addr):
+            continue
+
         symbol = token.get("symbol", "").upper()
-        if symbol in ("USDC", "USDT", "SOL", "WSOL", "WETH", "BTC", "WBTC"):
+        if symbol in EXCLUDED_SYMBOLS:
             continue
 
         daily_volume = token.get("daily_volume") or token.get("v24hUSD") or 0
@@ -146,11 +162,10 @@ async def scan_jupiter(session: aiohttp.ClientSession):
 
         await asyncio.sleep(0.5)
 
-        # Fetch price data for this token
         price_data = await fetch_token_price(session, addr)
 
         print(
-            f"[jupiter] Alert: {symbol} | "
+            f"[jupiter] Alert: {symbol} entered top 20 | "
             f"vol=${daily_volume:,.0f} | "
             f"addr={addr[:8]}..."
         )
@@ -164,5 +179,6 @@ async def scan_jupiter(session: aiohttp.ClientSession):
         _mark_alerted(addr)
         alerts_sent += 1
 
+    previous_top = current_top
     _cleanup_dedup()
     print(f"[jupiter] Done. Alerts: {alerts_sent}")

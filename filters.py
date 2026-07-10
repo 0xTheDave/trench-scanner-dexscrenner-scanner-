@@ -14,8 +14,11 @@ FILTERS = {
     # Age
     "max_age_hours": 48,
 
-    # Momentum
+    # Momentum (1h) — applies to pairs older than 1h
     "min_price_change_h1": 5.0,
+
+    # Momentum (5m) — applies to very fresh pairs (<1h old)
+    "min_price_change_m5_fresh": 2.0,
 
     # Anti-rug: max % buys out of total txns — >90% buys = suspicious
     "max_buy_ratio": 0.90,
@@ -25,6 +28,13 @@ FILTERS = {
 
     # Anti-rug: min liquidity as % of mcap — <1% = rug risk
     "min_liq_to_mcap_ratio": 0.01,
+
+    # Anti-wash-trading: vol 24h more than 50x liquidity = fake volume
+    "max_vol_to_liq_ratio": 50.0,
+
+    # MCap bounds — outside this range is not an early gem
+    "min_mcap": 50_000,
+    "max_mcap": 10_000_000,
 
     # Honeypot: if buys >= threshold and sells == 0 = can't sell
     "honeypot_min_buys_threshold": 50,

@@ -11,8 +11,14 @@ from discord_client import send_liquidation_alert
 HYPERLIQUID_WS = "wss://api.hyperliquid.xyz/ws"
 HYPERLIQUID_API = "https://api.hyperliquid.xyz/info"
 
-# Minimum liquidation size in USD to alert
-MIN_LIQUIDATION_USD = 100_000
+# Per-coin USD thresholds — large caps need much higher bars
+# to avoid alert spam from routine institutional flow
+COIN_THRESHOLDS = {
+    "BTC": 2_000_000,
+    "ETH": 1_000_000,
+    "SOL": 500_000,
+}
+DEFAULT_THRESHOLD = 200_000
 
 # Top coins to monitor by OI — refreshed on startup
 MAX_COINS_TO_MONITOR = 20
@@ -20,9 +26,13 @@ MAX_COINS_TO_MONITOR = 20
 # Ping interval to keep WS alive (server closes after 60s idle)
 PING_INTERVAL = 20
 
-# Dedup: don't re-alert same coin within 60s
-DEDUP_TTL = 60
+# Dedup: don't re-alert same coin within 5 minutes
+DEDUP_TTL = 300
 alerted: dict[str, float] = {}
+
+
+def _get_threshold(coin: str) -> float:
+    return COIN_THRESHOLDS.get(coin, DEFAULT_THRESHOLD)
 
 
 def _is_deduped(coin: str) -> bool:
@@ -91,32 +101,18 @@ def _fallback_coins() -> list[str]:
 
 def _parse_liquidation(trade: dict, coin: str) -> dict | None:
     """
-    Parse a trade message and return liquidation data if it qualifies.
-    Hyperliquid marks liquidations with liquidation field in trade.
+    Parse a trade message and return event data if it qualifies.
+    Note: the public trades feed does not reliably tag liquidations,
+    so this monitor reports LARGE TRADES above per-coin thresholds.
     """
-    # Trade structure: {coin, side, px, sz, time, hash, tid, users}
-    # Liquidations have users[0] or users[1] as liquidator address pattern
     side = trade.get("side", "")
     px = float(trade.get("px", 0) or 0)
     sz = float(trade.get("sz", 0) or 0)
     trade_usd = px * sz
 
-    if trade_usd < MIN_LIQUIDATION_USD:
-        return None
+    threshold = _get_threshold(coin)
 
-    # Hyperliquid liquidation trades have "liquidation" key or
-    # users array where one address matches liquidator pattern
-    users = trade.get("users", [])
-    is_liquidation = (
-        trade.get("liquidation") is True
-        or (len(users) == 2 and any("liquidat" in str(u).lower() for u in users))
-    )
-
-    # Also catch very large single trades as notable events
-    # even if not tagged as liquidation
-    is_large = trade_usd >= MIN_LIQUIDATION_USD * 2
-
-    if not (is_liquidation or is_large):
+    if trade_usd < threshold:
         return None
 
     return {
@@ -126,15 +122,15 @@ def _parse_liquidation(trade: dict, coin: str) -> dict | None:
         "size": sz,
         "usd_value": trade_usd,
         "time": trade.get("time", int(time.time() * 1000)),
-        "is_liquidation": is_liquidation,
+        "is_liquidation": False,  # public feed can't confirm liquidations
     }
 
 
 async def run_liquidation_monitor(session: aiohttp.ClientSession):
     """
     Main WebSocket loop.
-    Subscribes to trades for top coins, detects large liquidations.
-    Reconnects automatically on disconnect.
+    Subscribes to trades for top coins, detects large trades
+    above per-coin thresholds. Reconnects automatically on disconnect.
     """
     top_coins = await fetch_top_coins(session)
 
@@ -148,21 +144,19 @@ async def run_liquidation_monitor(session: aiohttp.ClientSession):
             ) as ws:
                 print("[liq] Connected")
 
-                # Subscribe to trades for each coin
                 for coin in top_coins:
                     sub_msg = {
                         "method": "subscribe",
                         "subscription": {"type": "trades", "coin": coin}
                     }
                     await ws.send_str(json.dumps(sub_msg))
-                    await asyncio.sleep(0.05)  # small delay between subs
+                    await asyncio.sleep(0.05)
 
                 print(f"[liq] Subscribed to {len(top_coins)} trade feeds")
 
                 last_ping = time.time()
 
                 async for msg in ws:
-                    # Send ping every 20s to keep connection alive
                     if time.time() - last_ping >= PING_INTERVAL:
                         await ws.send_str(json.dumps({"method": "ping"}))
                         last_ping = time.time()
@@ -175,7 +169,6 @@ async def run_liquidation_monitor(session: aiohttp.ClientSession):
 
                         channel = data.get("channel", "")
 
-                        # Skip subscription acks and pongs
                         if channel in ("subscriptionResponse", "pong"):
                             continue
 
@@ -183,37 +176,27 @@ async def run_liquidation_monitor(session: aiohttp.ClientSession):
                             continue
 
                         trades = data.get("data", [])
-                        if not isinstance(trades, list):
+                        if not isinstance(trades, list) or not trades:
                             continue
 
-                        # Extract coin from subscription data
-                        coin = None
-                        for sub_coin in top_coins:
-                            # Match by checking trade coin field
-                            if trades and trades[0].get("coin") == sub_coin:
-                                coin = sub_coin
-                                break
-
-                        if coin is None and trades:
-                            coin = trades[0].get("coin", "???")
+                        coin = trades[0].get("coin", "???")
 
                         for trade in trades:
-                            liq = _parse_liquidation(trade, coin or "???")
-                            if liq is None:
+                            event = _parse_liquidation(trade, coin)
+                            if event is None:
                                 continue
 
-                            if _is_deduped(liq["coin"]):
+                            if _is_deduped(event["coin"]):
                                 continue
 
                             print(
-                                f"[liq] 🔥 {liq['coin']} | "
-                                f"{'LIQ' if liq['is_liquidation'] else 'LARGE'} | "
-                                f"${liq['usd_value']:,.0f} | "
-                                f"side={liq['side']}"
+                                f"[liq] 🐋 {event['coin']} | LARGE | "
+                                f"${event['usd_value']:,.0f} | "
+                                f"side={event['side']}"
                             )
 
-                            await send_liquidation_alert(session, liq)
-                            _mark_alerted(liq["coin"])
+                            await send_liquidation_alert(session, event)
+                            _mark_alerted(event["coin"])
                             _cleanup_dedup()
 
                     elif msg.type == aiohttp.WSMsgType.ERROR:

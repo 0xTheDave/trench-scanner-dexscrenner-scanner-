@@ -9,29 +9,29 @@ from discord_client import send_boost_alert
 
 DEXSCREENER_BASE = "https://api.dexscreener.com"
 
-SCAN_INTERVAL_SECONDS = 300         # every 5 minutes
-DEDUP_TTL = 3600                    # don't re-alert same token within 1h
-MIN_BOOST_AMOUNT = 10               # minimum boost amount to alert
-TARGET_CHAIN = "solana"             # filter by chain
+MIN_BOOST_AMOUNT = 50               # minimum boost amount to alert
+TARGET_CHAIN = "solana"
+CLEANUP_TTL = 7 * 86_400            # drop tracking entries after 7 days
 
-# In-memory dedup
-alerted_boosts: dict[str, float] = {}
-
-
-def _is_deduped(address: str) -> bool:
-    last = alerted_boosts.get(address)
-    if last is None:
-        return False
-    return time.time() - last < DEDUP_TTL
+# Track last alerted totalAmount per token — re-alert only when boosts grow
+alerted_boosts: dict[str, dict] = {}  # addr -> {"ts": float, "total": int}
 
 
-def _mark_alerted(address: str):
-    alerted_boosts[address] = time.time()
+def _should_alert(address: str, total_amount: int) -> bool:
+    entry = alerted_boosts.get(address)
+    if entry is None:
+        return True
+    # Re-alert only if total boosts grew since last alert
+    return total_amount > entry["total"]
 
 
-def _cleanup_dedup():
+def _mark_alerted(address: str, total_amount: int):
+    alerted_boosts[address] = {"ts": time.time(), "total": total_amount}
+
+
+def _cleanup():
     now = time.time()
-    expired = [k for k, v in alerted_boosts.items() if now - v > DEDUP_TTL]
+    expired = [k for k, v in alerted_boosts.items() if now - v["ts"] > CLEANUP_TTL]
     for k in expired:
         del alerted_boosts[k]
 
@@ -83,16 +83,15 @@ async def scan_boosts(session: aiohttp.ClientSession):
     """
     Fetch latest boosted tokens and top boosted tokens.
     Alert on new boosts that pass minimum threshold.
+    Re-alerts only when a token's total boost count grows.
     """
     print(f"[boost] {datetime.now().strftime('%H:%M:%S')} — scanning boosts...")
 
-    # Fetch both endpoints in parallel
     latest, top = await asyncio.gather(
         fetch_json(session, f"{DEXSCREENER_BASE}/token-boosts/latest/v1"),
         fetch_json(session, f"{DEXSCREENER_BASE}/token-boosts/top/v1"),
     )
 
-    # Merge and deduplicate by tokenAddress
     all_boosts: list[dict] = []
     seen_in_batch: set[str] = set()
 
@@ -121,10 +120,9 @@ async def scan_boosts(session: aiohttp.ClientSession):
         if amount < MIN_BOOST_AMOUNT:
             continue
 
-        if _is_deduped(addr):
+        if not _should_alert(addr, total_amount):
             continue
 
-        # Enrich with market data
         await asyncio.sleep(0.5)
         pair = await fetch_pair_data(session, addr)
 
@@ -139,8 +137,8 @@ async def scan_boosts(session: aiohttp.ClientSession):
             "pair": pair,
         })
 
-        _mark_alerted(addr)
+        _mark_alerted(addr, total_amount)
         alerts_sent += 1
 
-    _cleanup_dedup()
+    _cleanup()
     print(f"[boost] Done. Alerts: {alerts_sent}")

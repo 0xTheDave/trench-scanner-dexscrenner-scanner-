@@ -16,6 +16,7 @@ from liquidation_monitor import run_liquidation_monitor
 from boost_monitor import scan_boosts
 from community_takeover_monitor import scan_takeovers
 from jupiter_monitor import scan_jupiter
+from robinhood_monitor import scan_robinhood
 
 DEXSCREENER_BASE = "https://api.dexscreener.com"
 
@@ -26,6 +27,7 @@ FUNDING_SCAN_INTERVAL_SECONDS = 1800
 BOOST_SCAN_INTERVAL_SECONDS = 300
 TAKEOVER_SCAN_INTERVAL_SECONDS = 300
 JUPITER_SCAN_INTERVAL_SECONDS = 300
+ROBINHOOD_SCAN_INTERVAL_SECONDS = 120
 
 REQUEST_DELAY = 1.0
 
@@ -71,8 +73,10 @@ def passes_filters(pair: dict, age_hours: float) -> tuple[bool, str]:
     sells = txns.get("sells", 0)
     total_txns = buys + sells
     ch_h1 = (pair.get("priceChange") or {}).get("h1") or 0
+    ch_m5 = (pair.get("priceChange") or {}).get("m5") or 0
     mcap = pair.get("marketCap") or pair.get("fdv") or 0
 
+    # Base filters
     if liq < FILTERS["min_liquidity_usd"]:
         return False, f"liq_low ${liq:,.0f}"
     if liq > FILTERS["max_liquidity_usd"]:
@@ -83,12 +87,31 @@ def passes_filters(pair: dict, age_hours: float) -> tuple[bool, str]:
         return False, f"txns_low {total_txns}"
     if age_hours > FILTERS["max_age_hours"]:
         return False, f"too_old {age_hours:.1f}h"
-    if ch_h1 < FILTERS["min_price_change_h1"]:
-        return False, f"no_momentum {ch_h1:.1f}%"
 
+    # Momentum: fresh pairs (<1h) use 5m change, older pairs use 1h change
+    if age_hours < 1.0:
+        if ch_m5 < FILTERS["min_price_change_m5_fresh"]:
+            return False, f"no_momentum_fresh {ch_m5:.1f}% (5m)"
+    else:
+        if ch_h1 < FILTERS["min_price_change_h1"]:
+            return False, f"no_momentum {ch_h1:.1f}%"
+
+    # MCap bounds
+    if mcap > 0:
+        if mcap < FILTERS["min_mcap"]:
+            return False, f"mcap_low ${mcap:,.0f}"
+        if mcap > FILTERS["max_mcap"]:
+            return False, f"mcap_high ${mcap:,.0f}"
+
+    # Anti-wash-trading: volume far exceeding liquidity = fake activity
+    if liq > 0 and (vol / liq) > FILTERS["max_vol_to_liq_ratio"]:
+        return False, f"wash_trading vol/liq={vol/liq:.0f}x"
+
+    # Honeypot: many buys but zero sells = can't sell
     if buys >= FILTERS["honeypot_min_buys_threshold"] and sells == 0:
         return False, f"honeypot {buys} buys / 0 sells"
 
+    # Anti-rug: buy/sell ratio
     if total_txns > 0:
         buy_ratio = buys / total_txns
         if buy_ratio > FILTERS["max_buy_ratio"]:
@@ -96,6 +119,7 @@ def passes_filters(pair: dict, age_hours: float) -> tuple[bool, str]:
         if buy_ratio < FILTERS["min_buy_ratio"]:
             return False, f"dump {buy_ratio:.0%} buys"
 
+    # Anti-rug: liquidity vs mcap
     if mcap > 0:
         liq_ratio = liq / mcap
         if liq_ratio < FILTERS["min_liq_to_mcap_ratio"]:
@@ -317,10 +341,15 @@ async def main_loop(session: aiohttp.ClientSession):
     last_boost = 0
     last_takeover = 0
     last_jupiter = 0
+    last_robinhood = 0
 
     while True:
         try:
             await scan_tokens(session)
+
+            if time.time() - last_robinhood >= ROBINHOOD_SCAN_INTERVAL_SECONDS:
+                await scan_robinhood(session)
+                last_robinhood = time.time()
 
             if time.time() - last_watchlist >= WATCHLIST_SCAN_INTERVAL_SECONDS:
                 await scan_watchlist(session)
@@ -356,8 +385,9 @@ async def main_loop(session: aiohttp.ClientSession):
 async def main():
     print("=" * 50)
     print("Trench Scanner — starting")
-    print(f"Chain: {FILTERS['chain_id']}")
+    print(f"Chain: {FILTERS['chain_id']} + robinhood")
     print(f"Scan interval: {SCAN_INTERVAL_SECONDS}s")
+    print(f"Robinhood interval: {ROBINHOOD_SCAN_INTERVAL_SECONDS}s")
     print(f"Watchlist interval: {WATCHLIST_SCAN_INTERVAL_SECONDS}s")
     print(f"Funding interval: {FUNDING_SCAN_INTERVAL_SECONDS}s")
     print(f"Boost interval: {BOOST_SCAN_INTERVAL_SECONDS}s")
@@ -375,6 +405,7 @@ async def main():
         "DISCORD_WEBHOOK_BOOSTED",
         "DISCORD_WEBHOOK_TAKEOVERS",
         "DISCORD_WEBHOOK_JUPITER",
+        "DISCORD_WEBHOOK_ROBINHOOD",
     ]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:

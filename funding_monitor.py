@@ -13,6 +13,7 @@ FUNDING_HIGH_THRESHOLD = 0.0005     # +0.05%/h = overcrowded long
 FUNDING_LOW_THRESHOLD = -0.0002     # -0.02%/h = overcrowded short
 OI_CHANGE_THRESHOLD = 0.20          # 20% OI change since last snapshot
 MIN_OI_USD = 1_000_000              # ignore markets under $1M OI
+MIN_DAY_VOLUME = 500_000            # skip markets with dead volume
 ALERT_DEDUP_TTL = 3600              # don't re-alert same coin within 1h
 
 # In-memory stores
@@ -111,6 +112,10 @@ async def scan_funding(session: aiohttp.ClientSession):
 
         # Skip tiny markets
         if oi_usd < MIN_OI_USD:
+            continue
+
+        # Skip markets with high OI but dead trading activity
+        if day_vol < MIN_DAY_VOLUME:
             continue
 
         signal = None

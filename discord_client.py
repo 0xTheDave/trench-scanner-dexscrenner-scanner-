@@ -528,7 +528,7 @@ async def send_jupiter_alert(session: aiohttp.ClientSession, token_data: dict):
 
     # Price from Jupiter price API
     if price_data:
-        price = price_data.get("price") or "N/A"
+        price = price_data.get("usdPrice") or price_data.get("price") or "N/A"
         confidence = price_data.get("extraInfo", {}).get("confidenceLevel") or "unknown"
         price_str = f"${float(price):,.6f}" if price != "N/A" else "N/A"
     else:
@@ -574,7 +574,7 @@ async def send_jupiter_alert(session: aiohttp.ClientSession, token_data: dict):
             "title": f"🪐 {tier} — ${symbol}",
             "description": (
                 f"**{name}**\n"
-                f"High routing volume through Jupiter aggregator"
+                f"🆕 Just entered Jupiter top 20 by volume"
             ),
             "color": color,
             "fields": fields,
