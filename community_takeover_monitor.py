@@ -9,9 +9,9 @@ from discord_client import send_takeover_alert
 
 DEXSCREENER_BASE = "https://api.dexscreener.com"
 
-SCAN_INTERVAL_SECONDS = 300         # every 5 minutes
 DEDUP_TTL = 86_400                  # don't re-alert same token within 24h
 TARGET_CHAIN = "solana"
+MAX_CLAIM_AGE_HOURS = 1            # only alert takeovers claimed within last 1h
 
 alerted_takeovers: dict[str, float] = {}
 
@@ -32,6 +32,22 @@ def _cleanup_dedup():
     expired = [k for k, v in alerted_takeovers.items() if now - v > DEDUP_TTL]
     for k in expired:
         del alerted_takeovers[k]
+
+
+def _claim_age_hours(claim_date: str) -> float:
+    """Parse ISO claimDate and return age in hours. Returns 9999 on failure."""
+    if not claim_date:
+        return 9999.0
+    try:
+        # Handle both with and without timezone suffix
+        cleaned = claim_date.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(cleaned)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - dt
+        return delta.total_seconds() / 3600
+    except (ValueError, TypeError):
+        return 9999.0
 
 
 async def fetch_json(session: aiohttp.ClientSession, url: str) -> dict | list | None:
@@ -75,7 +91,7 @@ async def fetch_pair_data(
 
 
 async def scan_takeovers(session: aiohttp.ClientSession):
-    """Fetch latest community takeovers and alert."""
+    """Fetch latest community takeovers and alert on fresh ones only."""
     print(f"[takeover] {datetime.now().strftime('%H:%M:%S')} — scanning community takeovers...")
 
     data = await fetch_json(
@@ -87,23 +103,29 @@ async def scan_takeovers(session: aiohttp.ClientSession):
         print("[takeover] No data received")
         return
 
-    # Filter by chain
     takeovers = [t for t in data if t.get("chainId") == TARGET_CHAIN]
     print(f"[takeover] Found {len(takeovers)} takeovers on {TARGET_CHAIN}")
 
     alerts_sent = 0
+    skipped_old = 0
 
     for takeover in takeovers:
         addr = takeover.get("tokenAddress")
         if not addr or _is_deduped(addr):
             continue
 
+        claim_date = takeover.get("claimDate", "")
+        age_hours = _claim_age_hours(claim_date)
+
+        # Skip stale takeovers — restart-proof freshness filter
+        if age_hours > MAX_CLAIM_AGE_HOURS:
+            _mark_alerted(addr)
+            skipped_old += 1
+            continue
+
         await asyncio.sleep(0.5)
 
-        # Enrich with market data
         pair = await fetch_pair_data(session, addr)
-
-        claim_date = takeover.get("claimDate", "")
 
         print(f"[takeover] Alert: {addr[:8]}... | claimed={claim_date[:10] if claim_date else 'unknown'}")
 
@@ -116,4 +138,4 @@ async def scan_takeovers(session: aiohttp.ClientSession):
         alerts_sent += 1
 
     _cleanup_dedup()
-    print(f"[takeover] Done. Alerts: {alerts_sent}")
+    print(f"[takeover] Done. Alerts: {alerts_sent}, skipped stale: {skipped_old}")

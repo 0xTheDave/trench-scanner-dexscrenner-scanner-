@@ -2,9 +2,20 @@
 
 import asyncio
 import aiohttp
+import json
 import os
 import time
 from datetime import datetime, timezone
+
+import db
+from haiku_client import get_or_classify_token_type
+from geckoterminal_client import (
+    resolve_network_id,
+    fetch_pool_only,
+    fetch_ohlcv,
+    format_unique_traders,
+)
+from chart_renderer import render_chart_async
 
 DEXSCREENER_BASE = "https://api.dexscreener.com"
 WEBHOOK_ROBINHOOD = os.environ.get("DISCORD_WEBHOOK_ROBINHOOD", "")
@@ -12,6 +23,18 @@ WEBHOOK_ROBINHOOD = os.environ.get("DISCORD_WEBHOOK_ROBINHOOD", "")
 # Expected chainId string on DexScreener — verified via chain page URL.
 # If no tokens ever match, check the [robinhood] chainIds log line below.
 ROBINHOOD_CHAIN_ID = "robinhood"
+
+# GeckoTerminal network id for Robinhood Chain — resolved once at first use
+# (confirmed 'robinhood' via diagnostic, but resolved live in case it changes).
+_gecko_network_id: str | None = None
+_gecko_network_resolved = False
+
+# Rate-limit valve: unique-traders (the pool call) runs for every alert, but
+# the OHLCV/chart call (the 2nd gecko call) is only spent on stronger movers,
+# to keep total GeckoTerminal load well under the ~30/min ceiling. Loosen these
+# once 429s are gone if you want charts on more alerts. tune on data
+CHART_MIN_CH_H1 = 30.0
+CHART_MIN_VOL_H24 = 100_000
 
 # Robinhood Chain is brand new — thresholds are looser than Solana filters
 RH_FILTERS = {
@@ -56,6 +79,24 @@ def _cleanup():
         del seen_robinhood[k]
 
 
+async def _get_gecko_network_id(session: aiohttp.ClientSession) -> str | None:
+    """
+    Lazily resolve (and cache) GeckoTerminal's network id for Robinhood Chain.
+    Resolved once per process. Returns None if GeckoTerminal doesn't expose it —
+    in which case enrichment is simply skipped, never an error.
+    """
+    global _gecko_network_id, _gecko_network_resolved
+    if _gecko_network_resolved:
+        return _gecko_network_id
+    _gecko_network_id = await resolve_network_id(session, "robinhood")
+    _gecko_network_resolved = True
+    if _gecko_network_id:
+        print(f"[robinhood] GeckoTerminal network id resolved: {_gecko_network_id!r}")
+    else:
+        print("[robinhood] GeckoTerminal has no robinhood network — enrichment disabled")
+    return _gecko_network_id
+
+
 def _fmt_usd(value: float) -> str:
     if value >= 1_000_000:
         return f"${value/1_000_000:.2f}M"
@@ -90,6 +131,32 @@ def _fmt_socials(info: dict) -> str:
         if url:
             parts.append(f"[Web]({url})")
     return " · ".join(parts) if parts else "None"
+
+
+def _social_context(info: dict) -> str | None:
+    """Plain-text social summary for the Haiku classification prompt."""
+    if not info:
+        return None
+    parts = []
+    for social in (info.get("socials") or []):
+        platform = social.get("platform", "")
+        handle = social.get("handle", "")
+        if platform and handle:
+            parts.append(f"{platform}: {handle}")
+    for site in (info.get("websites") or []):
+        url = site.get("url", "")
+        if url:
+            parts.append(f"Website: {url}")
+    return ", ".join(parts) if parts else None
+
+
+def _fmt_token_type(classification: dict | None) -> str:
+    icons = {"meme": "🐸 Meme", "utility": "🛠️ Utility", "unknown": "❓ Unknown"}
+    if not classification:
+        return icons["unknown"]
+    label = icons.get(classification.get("type"), icons["unknown"])
+    reason = classification.get("reason") or ""
+    return f"{label} — {reason}" if reason else label
 
 
 async def _fetch_json(session: aiohttp.ClientSession, url: str) -> dict | list | None:
@@ -162,6 +229,9 @@ async def _send_robinhood_alert(
     pair: dict,
     age_hours: float,
     source: str,
+    classification: dict | None,
+    enrichment: dict | None,
+    chart_png: bytes | None,
 ):
     """Send Robinhood Chain gem alert to #robinhood-gems channel."""
     symbol = pair.get("baseToken", {}).get("symbol", "???").lstrip("$")
@@ -195,36 +265,58 @@ async def _send_robinhood_alert(
 
     source_label = "🆕 New listing" if source == "latest" else "🔄 Recent update"
 
+    fields = [
+        {"name": "📋 CA", "value": f"`{addr}`", "inline": False},
+        {"name": "💵 Price", "value": f"${price}", "inline": True},
+        {"name": "📦 MCap", "value": _fmt_usd(mcap), "inline": True},
+        {"name": "⏱️ Age", "value": f"{age_hours:.1f}h", "inline": True},
+        {"name": "💧 Liquidity", "value": _fmt_usd(liq), "inline": True},
+        {"name": "📊 Vol 24h", "value": _fmt_usd(vol_h24), "inline": True},
+        {"name": "⚡ Vol 5m", "value": _fmt_usd(vol_m5), "inline": True},
+        {"name": "📈 5m", "value": f"{ch_m5:+.1f}%", "inline": True},
+        {"name": "📈 1h", "value": f"{ch_h1:+.1f}%", "inline": True},
+        {"name": "📈 6h / 24h", "value": f"{ch_h6:+.1f}% / {ch_h24:+.1f}%", "inline": True},
+        {"name": "🔄 Buy/Sell ratio", "value": _fmt_ratio(buys, sells), "inline": False},
+        # GeckoTerminal enrichment: unique wallets, not raw txn counts — exposes
+        # bot-inflated buy ratios that DexScreener's %-buys alone would hide.
+        {"name": "👥 Unique traders (1h)", "value": format_unique_traders(enrichment), "inline": False},
+        {"name": "📉 Vol/Liq ratio", "value": f"{vol_liq_ratio:.1f}x", "inline": True},
+        {"name": "🏷️ Type", "value": _fmt_token_type(classification), "inline": False},
+        {"name": "🔗 Socials", "value": _fmt_socials(info), "inline": False},
+    ]
+
     embed = {
-        "embeds": [{
-            "title": f"🏹 ROBINHOOD GEM — ${symbol}",
-            "description": (
-                f"**{name}**\n"
-                f"{source_label} · DEX: {dex_id}\n"
-                f"[📊 DexScreener]({dex_url})"
-            ),
-            "color": color,
-            "fields": [
-                {"name": "📋 CA", "value": f"`{addr}`", "inline": False},
-                {"name": "💵 Price", "value": f"${price}", "inline": True},
-                {"name": "📦 MCap", "value": _fmt_usd(mcap), "inline": True},
-                {"name": "⏱️ Age", "value": f"{age_hours:.1f}h", "inline": True},
-                {"name": "💧 Liquidity", "value": _fmt_usd(liq), "inline": True},
-                {"name": "📊 Vol 24h", "value": _fmt_usd(vol_h24), "inline": True},
-                {"name": "⚡ Vol 5m", "value": _fmt_usd(vol_m5), "inline": True},
-                {"name": "📈 5m", "value": f"{ch_m5:+.1f}%", "inline": True},
-                {"name": "📈 1h", "value": f"{ch_h1:+.1f}%", "inline": True},
-                {"name": "📈 6h / 24h", "value": f"{ch_h6:+.1f}% / {ch_h24:+.1f}%", "inline": True},
-                {"name": "🔄 Buy/Sell ratio", "value": _fmt_ratio(buys, sells), "inline": False},
-                {"name": "📉 Vol/Liq ratio", "value": f"{vol_liq_ratio:.1f}x", "inline": True},
-                {"name": "🔗 Socials", "value": _fmt_socials(info), "inline": False},
-            ],
-            "footer": {"text": "Trench Scanner • Robinhood Chain"},
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }]
+        "title": f"🏹 ROBINHOOD GEM — ${symbol}",
+        "description": (
+            f"**{name}**\n"
+            f"{source_label} · DEX: {dex_id}\n"
+            f"[📊 DexScreener]({dex_url})"
+        ),
+        "color": color,
+        "fields": fields,
+        "footer": {"text": "Trench Scanner • Robinhood Chain"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    async with session.post(WEBHOOK_ROBINHOOD, json=embed) as resp:
+    # When we have a chart, attach it and reference it from the embed via
+    # attachment://chart.png. Requires multipart/form-data, not plain JSON.
+    if chart_png:
+        embed["image"] = {"url": "attachment://chart.png"}
+        payload = {"embeds": [embed]}
+        form = aiohttp.FormData()
+        form.add_field("payload_json", json.dumps(payload))
+        form.add_field(
+            "file", chart_png,
+            filename="chart.png", content_type="image/png",
+        )
+        async with session.post(WEBHOOK_ROBINHOOD, data=form) as resp:
+            if resp.status not in (200, 204):
+                text = await resp.text()
+                print(f"[robinhood] Discord send error (multipart): {resp.status} {text}")
+            return resp.status
+
+    # No chart -> plain JSON send (fresh token, no OHLCV, or fetch failed)
+    async with session.post(WEBHOOK_ROBINHOOD, json={"embeds": [embed]}) as resp:
         if resp.status not in (200, 204):
             text = await resp.text()
             print(f"[robinhood] Discord send error: {resp.status} {text}")
@@ -304,13 +396,57 @@ async def scan_robinhood(session: aiohttp.ClientSession):
             _mark_seen(addr)
             continue
 
-        result = await _send_robinhood_alert(session, pair, age_hours, source)
+        symbol_for_classify = pair.get("baseToken", {}).get("symbol", "???").lstrip("$")
+        classification = await get_or_classify_token_type(session, addr, {
+            "symbol": symbol_for_classify,
+            "name": pair.get("baseToken", {}).get("name", symbol_for_classify),
+            "description": profile.get("description"),
+            "socials": _social_context(pair.get("info") or {}),
+        })
+
+        # GeckoTerminal enrichment — only for tokens we're actually alerting on
+        # (post-filter). The pool call (unique traders + pool_address) runs for
+        # every alert; the OHLCV/chart call is the rate-limit valve, spent only
+        # on stronger movers (see CHART_MIN_* above). Any failure yields None
+        # and simply drops that enrichment — never blocks the alert.
+        enrichment = None
+        chart_png = None
+        gecko_net = await _get_gecko_network_id(session)
+        if gecko_net:
+            enrichment = await fetch_pool_only(session, gecko_net, addr)
+            pool_addr = (enrichment or {}).get("pool_address")
+            ch_h1 = (pair.get("priceChange") or {}).get("h1") or 0
+            vol_h24 = (pair.get("volume") or {}).get("h24") or 0
+            render_chart = ch_h1 >= CHART_MIN_CH_H1 or vol_h24 >= CHART_MIN_VOL_H24
+            if pool_addr and render_chart:
+                ohlcv = await fetch_ohlcv(session, gecko_net, pool_addr)
+                if ohlcv:
+                    chart_png = await render_chart_async(
+                        ohlcv, symbol_for_classify, "5m"
+                    )
+
+        result = await _send_robinhood_alert(
+            session, pair, age_hours, source, classification, enrichment, chart_png
+        )
         _mark_seen(addr)
 
         if result in (200, 204):
             symbol = pair.get("baseToken", {}).get("symbol", "???")
             liq = (pair.get("liquidity") or {}).get("usd") or 0
-            print(f"[robinhood] ✅ ${symbol.lstrip('$')} [{source}] | age={age_hours:.1f}h | liq=${liq:,.0f}")
+
+            # Record for performance tracking — MISSING before, so #robinhood
+            # never appeared in reports. Address is a 0x EVM address; the tracker
+            # infers the robinhood chain from that format when measuring prices.
+            try:
+                alert_price = float(pair.get("priceUsd") or 0)
+            except (ValueError, TypeError):
+                alert_price = 0.0
+            db.record_alert(
+                addr, symbol.lstrip("$"), "robinhood", alert_price, liquidity=liq,
+            )
+
+            chart_tag = " +chart" if chart_png else ""
+            print(f"[robinhood] ✅ ${symbol.lstrip('$')} [{source}] | age={age_hours:.1f}h | liq=${liq:,.0f}{chart_tag}")
             alerts_sent += 1
 
     _cleanup()

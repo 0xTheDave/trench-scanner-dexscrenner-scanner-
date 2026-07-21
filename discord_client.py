@@ -1,6 +1,7 @@
 # discord_client.py
 
 import aiohttp
+import json
 import os
 from datetime import datetime, timezone
 
@@ -12,6 +13,7 @@ WEBHOOK_LIQUIDATIONS = os.environ["DISCORD_WEBHOOK_LIQUIDATIONS"]
 WEBHOOK_BOOSTED = os.environ["DISCORD_WEBHOOK_BOOSTED"]
 WEBHOOK_TAKEOVERS = os.environ["DISCORD_WEBHOOK_TAKEOVERS"]
 WEBHOOK_JUPITER = os.environ["DISCORD_WEBHOOK_JUPITER"]
+WEBHOOK_ALPHA = os.environ["DISCORD_WEBHOOK_ALPHA"]
 
 
 def _fmt_usd(value: float) -> str:
@@ -48,6 +50,26 @@ def _fmt_socials(info: dict) -> str:
         if url:
             parts.append(f"[Web]({url})")
     return " · ".join(parts) if parts else "None"
+
+
+def _fmt_token_type(classification: dict | None) -> str:
+    icons = {"meme": "🐸 Meme", "utility": "🛠️ Utility", "unknown": "❓ Unknown"}
+    if not classification:
+        return icons["unknown"]
+    label = icons.get(classification.get("type"), icons["unknown"])
+    reason = classification.get("reason") or ""
+    return f"{label} — {reason}" if reason else label
+
+
+def _fmt_unique_traders(enrichment: dict | None) -> str:
+    """Unique buyers/sellers label from GeckoTerminal enrichment. 'n/a' if missing."""
+    if not enrichment:
+        return "n/a"
+    b = enrichment.get("buyers_h1")
+    s = enrichment.get("sellers_h1")
+    if b is None and s is None:
+        return "n/a"
+    return f"{b if b is not None else '?'} buyers / {s if s is not None else '?'} sellers (1h)"
 
 
 def _fmt_boost_links(links: list) -> str:
@@ -520,13 +542,15 @@ async def send_jupiter_alert(session: aiohttp.ClientSession, token_data: dict):
     token = token_data["token"]
     price_data = token_data.get("price_data")
     daily_volume = token_data.get("daily_volume", 0)
+    classification = token_data.get("classification")
+    enrichment = token_data.get("enrichment")
+    chart_png = token_data.get("chart_png")
 
     symbol = (token.get("symbol") or "???").lstrip("$")
     name = token.get("name") or symbol
     addr = token.get("address") or ""
     created_at = token.get("created_at") or ""
 
-    # Price from Jupiter price API
     if price_data:
         price = price_data.get("usdPrice") or price_data.get("price") or "N/A"
         confidence = price_data.get("extraInfo", {}).get("confidenceLevel") or "unknown"
@@ -535,11 +559,9 @@ async def send_jupiter_alert(session: aiohttp.ClientSession, token_data: dict):
         price_str = "N/A"
         confidence = "unknown"
 
-    # Token metadata
     tags = token.get("tags") or []
     tags_str = ", ".join(tags[:5]) if tags else "None"
 
-    # Volume tier label
     if daily_volume >= 1_000_000:
         tier = "🔥🔥🔥 MEGA VOLUME"
         color = 0xFF0000
@@ -555,6 +577,9 @@ async def send_jupiter_alert(session: aiohttp.ClientSession, token_data: dict):
         {"name": "💵 Price", "value": price_str, "inline": True},
         {"name": "📊 Jupiter Vol 24h", "value": _fmt_usd(daily_volume), "inline": True},
         {"name": "🎯 Confidence", "value": confidence, "inline": True},
+        # GeckoTerminal enrichment: unique wallets, not raw txn counts.
+        {"name": "👥 Unique traders (1h)", "value": _fmt_unique_traders(enrichment), "inline": False},
+        {"name": "🏷️ Type", "value": _fmt_token_type(classification), "inline": False},
     ]
 
     if tags_str != "None":
@@ -570,20 +595,34 @@ async def send_jupiter_alert(session: aiohttp.ClientSession, token_data: dict):
     })
 
     embed = {
-        "embeds": [{
-            "title": f"🪐 {tier} — ${symbol}",
-            "description": (
-                f"**{name}**\n"
-                f"🆕 Just entered Jupiter top 20 by volume"
-            ),
-            "color": color,
-            "fields": fields,
-            "footer": {"text": "Trench Scanner • Jupiter API"},
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }]
+        "title": f"🪐 {tier} — ${symbol}",
+        "description": (
+            f"**{name}**\n"
+            f"🆕 Just entered a Jupiter 1h leaderboard"
+        ),
+        "color": color,
+        "fields": fields,
+        "footer": {"text": "Trench Scanner • Jupiter API"},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    async with session.post(WEBHOOK_JUPITER, json=embed) as resp:
+    # When we have a chart, attach it via multipart and reference it in the
+    # embed; otherwise plain JSON. Chart is best-effort — alert always goes out.
+    if chart_png:
+        embed["image"] = {"url": "attachment://chart.png"}
+        form = aiohttp.FormData()
+        form.add_field("payload_json", json.dumps({"embeds": [embed]}))
+        form.add_field(
+            "file", chart_png,
+            filename="chart.png", content_type="image/png",
+        )
+        async with session.post(WEBHOOK_JUPITER, data=form) as resp:
+            if resp.status not in (200, 204):
+                text = await resp.text()
+                print(f"[discord] Jupiter alert error (multipart): {resp.status} {text}")
+            return resp.status
+
+    async with session.post(WEBHOOK_JUPITER, json={"embeds": [embed]}) as resp:
         if resp.status not in (200, 204):
             text = await resp.text()
             print(f"[discord] Jupiter alert error: {resp.status} {text}")
@@ -622,4 +661,86 @@ async def send_narrative_update(session: aiohttp.ClientSession, metas: list[dict
     }
 
     async with session.post(WEBHOOK_NARRATIVES, json=embed) as resp:
+        return resp.status
+
+
+async def send_alpha_alert(session: aiohttp.ClientSession, data: dict):
+    """Send premium alpha pick alert with score, safety data, and AI TL;DR."""
+    pair = data["pair"]
+    score = data["score"]
+    breakdown = data["breakdown"]
+    rugcheck = data.get("rugcheck")
+    tldr = data.get("tldr")
+    age_hours = data["age_hours"]
+
+    symbol = pair.get("baseToken", {}).get("symbol", "???").lstrip("$")
+    name = pair.get("baseToken", {}).get("name", symbol)
+    addr = pair.get("baseToken", {}).get("address", "")
+
+    price = pair.get("priceUsd") or "N/A"
+    liq = (pair.get("liquidity") or {}).get("usd") or 0
+    vol_h24 = (pair.get("volume") or {}).get("h24") or 0
+    mcap = pair.get("marketCap") or pair.get("fdv") or 0
+    ch_h1 = (pair.get("priceChange") or {}).get("h1") or 0
+    ch_h24 = (pair.get("priceChange") or {}).get("h24") or 0
+    txns = (pair.get("txns") or {}).get("h24") or {}
+    buys = txns.get("buys", 0)
+    sells = txns.get("sells", 0)
+    dex_url = pair.get("url", "")
+    info = pair.get("info") or {}
+
+    if score >= 90:
+        color = 0xFFD700
+        tier = "💎 PREMIUM"
+    elif score >= 82:
+        color = 0x00FF00
+        tier = "🔥 STRONG"
+    else:
+        color = 0x00CC88
+        tier = "✨ SOLID"
+
+    fields = [
+        {"name": "📋 CA", "value": f"`{addr}`", "inline": False},
+        {"name": "🏆 Score", "value": f"**{score}/100**", "inline": True},
+        {"name": "💵 Price", "value": f"${price}", "inline": True},
+        {"name": "⏱️ Age", "value": f"{age_hours:.1f}h", "inline": True},
+        {"name": "📦 MCap", "value": _fmt_usd(mcap), "inline": True},
+        {"name": "💧 Liquidity", "value": _fmt_usd(liq), "inline": True},
+        {"name": "📊 Vol 24h", "value": _fmt_usd(vol_h24), "inline": True},
+        {"name": "📈 1h / 24h", "value": f"{ch_h1:+.1f}% / {ch_h24:+.1f}%", "inline": True},
+        {"name": "🔄 Buy/Sell", "value": _fmt_ratio(buys, sells), "inline": False},
+    ]
+
+    if tldr:
+        fields.append({"name": "🤖 AI TL;DR", "value": tldr[:1000], "inline": False})
+
+    breakdown_str = "\n".join(f"• {line}" for line in breakdown[:10])
+    if breakdown_str:
+        fields.append({"name": "📊 Score breakdown", "value": breakdown_str[:1000], "inline": False})
+
+    if rugcheck and rugcheck.get("risks"):
+        risks_str = ", ".join(rugcheck["risks"][:5])
+        fields.append({"name": "⚠️ RugCheck flags", "value": risks_str[:500], "inline": False})
+
+    fields.append({"name": "🔗 Socials", "value": _fmt_socials(info), "inline": False})
+
+    embed = {
+        "embeds": [{
+            "title": f"{tier} ALPHA PICK — ${symbol}",
+            "description": (
+                f"**{name}**\n"
+                f"Passed full quality + safety screening\n"
+                f"[📊 DexScreener]({dex_url})"
+            ),
+            "color": color,
+            "fields": fields,
+            "footer": {"text": "Trench Scanner • Alpha Picks • DYOR"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }]
+    }
+
+    async with session.post(WEBHOOK_ALPHA, json=embed) as resp:
+        if resp.status not in (200, 204):
+            text = await resp.text()
+            print(f"[discord] Alpha alert error: {resp.status} {text}")
         return resp.status

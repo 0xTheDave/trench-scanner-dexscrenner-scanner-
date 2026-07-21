@@ -8,15 +8,32 @@ import time
 import os
 from datetime import datetime, timezone
 
+import db
 from filters import FILTERS
 from state import SeenTokens, VolumeHistory
-from discord_client import send_gem_alert, send_narrative_update, send_spike_alert
+from discord_client import (
+    send_gem_alert,
+    send_narrative_update,
+    send_spike_alert,
+    send_alpha_alert,
+)
 from funding_monitor import scan_funding
 from liquidation_monitor import run_liquidation_monitor
 from boost_monitor import scan_boosts
 from community_takeover_monitor import scan_takeovers
 from jupiter_monitor import scan_jupiter
 from robinhood_monitor import scan_robinhood
+from migration_monitor import run_migration_monitor
+from performance_tracker import track_performance, maybe_send_performance_report
+from scoring import (
+    compute_base_score,
+    compute_safety_score,
+    ALPHA_THRESHOLD,
+    GEM_THRESHOLD,
+    RESCORE_TRIGGER,
+)
+from rugcheck_client import fetch_rugcheck_report
+from haiku_client import generate_tldr
 
 DEXSCREENER_BASE = "https://api.dexscreener.com"
 
@@ -28,14 +45,31 @@ BOOST_SCAN_INTERVAL_SECONDS = 300
 TAKEOVER_SCAN_INTERVAL_SECONDS = 300
 JUPITER_SCAN_INTERVAL_SECONDS = 300
 ROBINHOOD_SCAN_INTERVAL_SECONDS = 120
+PERF_TRACK_INTERVAL_SECONDS = 600
+# Poll often; the actual report cadence is gated inside
+# maybe_send_performance_report via a DB timestamp (restart-proof), so this is
+# just how often we CHECK whether a report is due — not how often one is sent.
+PERF_REPORT_POLL_SECONDS = 1800
 
 REQUEST_DELAY = 1.0
 
-seen = SeenTokens(ttl_seconds=FILTERS["dedup_ttl_seconds"])
+# Persistent dedup — restarts no longer cause duplicate alert waves
+seen = SeenTokens(ttl_seconds=FILTERS["dedup_ttl_seconds"], scope="main")
 vol_history = VolumeHistory(ttl_seconds=3600)
 
 watchlist: dict[str, dict] = {}
 seen_spikes = SeenTokens(ttl_seconds=600)
+
+# Tokens already promoted to alpha — persistent, 48h TTL (tokens older
+# than max_age_hours are never re-scored anyway)
+alpha_promoted = SeenTokens(ttl_seconds=172_800, scope="alpha_promoted")
+
+
+def _price_of(pair: dict) -> float:
+    try:
+        return float(pair.get("priceUsd") or 0)
+    except (ValueError, TypeError):
+        return 0.0
 
 
 async def fetch_json(session: aiohttp.ClientSession, url: str) -> dict | list | None:
@@ -145,13 +179,84 @@ def has_inline_spike(pair: dict) -> bool:
     return ratio >= FILTERS["spike_m5_to_h1_ratio"]
 
 
+def _rugcheck_debug_line(rugcheck: dict | None) -> str:
+    """One-line summary of parsed RugCheck fields for log verification."""
+    if rugcheck is None:
+        return "rugcheck=None"
+    return (
+        f"mint_active={rugcheck.get('mint_authority_active')} "
+        f"freeze_active={rugcheck.get('freeze_authority_active')} "
+        f"lp_locked={rugcheck.get('lp_locked_pct')} "
+        f"top10={rugcheck.get('top10_holders_pct')} "
+        f"risks={len(rugcheck.get('risks') or [])}"
+    )
+
+
+def _build_rugcheck_summary(rugcheck: dict | None) -> str:
+    """Human-readable safety summary for TL;DR context."""
+    if not rugcheck:
+        return "unknown"
+    parts = []
+    if rugcheck.get("mint_authority_active") is False:
+        parts.append("mint revoked")
+    if rugcheck.get("freeze_authority_active") is False:
+        parts.append("not freezable")
+    if rugcheck.get("lp_locked_pct") is not None:
+        parts.append(f"LP locked {rugcheck['lp_locked_pct']:.0f}%")
+    if rugcheck.get("top10_holders_pct") is not None:
+        parts.append(f"top10 hold {rugcheck['top10_holders_pct']:.0f}%")
+    return ", ".join(parts) if parts else "unknown"
+
+
+async def send_alpha_with_tldr(
+    session: aiohttp.ClientSession,
+    pair: dict,
+    score: int,
+    breakdown: list[str],
+    rugcheck: dict | None,
+    age_hours: float,
+    description: str = "",
+):
+    """Generate TL;DR and send alpha alert. Shared by discovery and promotion paths."""
+    symbol = pair.get("baseToken", {}).get("symbol", "???")
+    info = pair.get("info") or {}
+    socials_list = [s.get("platform", "") for s in (info.get("socials") or [])]
+
+    liq = (pair.get("liquidity") or {}).get("usd") or 0
+    vol_h24 = (pair.get("volume") or {}).get("h24") or 0
+    mcap = pair.get("marketCap") or pair.get("fdv") or 0
+    market_summary = (
+        f"MCap ${mcap:,.0f}, liquidity ${liq:,.0f}, "
+        f"vol 24h ${vol_h24:,.0f}, age {age_hours:.1f}h"
+    )
+
+    tldr = await generate_tldr(session, {
+        "symbol": symbol.lstrip("$"),
+        "name": pair.get("baseToken", {}).get("name", symbol),
+        "description": description,
+        "socials": ", ".join(socials_list) if socials_list else None,
+        "score": score,
+        "rugcheck_summary": _build_rugcheck_summary(rugcheck),
+        "market_summary": market_summary,
+    })
+
+    return await send_alpha_alert(session, {
+        "pair": pair,
+        "score": score,
+        "breakdown": breakdown,
+        "rugcheck": rugcheck,
+        "tldr": tldr,
+        "age_hours": age_hours,
+    })
+
+
 async def process_profile(
     session: aiohttp.ClientSession,
     profile: dict,
     source: str,
     alerts_sent_ref: list,
 ):
-    """Process a single token profile — shared logic for both sources."""
+    """Process a single token profile with scoring and safety pipeline."""
     addr = profile.get("tokenAddress")
     if not addr or seen.has(addr):
         return
@@ -178,20 +283,51 @@ async def process_profile(
     created_at = pair.get("pairCreatedAt")
     age_hours = (time.time() - created_at / 1000) / 3600 if created_at else 999
 
+    # Inline spike check
     if has_inline_spike(pair) and not seen_spikes.has(addr):
         symbol = pair.get("baseToken", {}).get("symbol", "?")
         print(f"[spike-B] Inline spike detected for {symbol}")
-        await send_spike_alert(session, pair, spike_type="inline")
+        result = await send_spike_alert(session, pair, spike_type="inline")
+        if result in (200, 204):
+            db.record_alert(
+                addr, str(symbol).lstrip("$"), "spikes", _price_of(pair),
+                liquidity=(pair.get("liquidity") or {}).get("usd") or 0,
+            )
         seen_spikes.add(addr)
 
+    # Stage 1: hard filters
     passed, reason = passes_filters(pair, age_hours)
-
     if not passed:
         symbol = pair.get("baseToken", {}).get("symbol", "???")
         print(f"[filter] {symbol} rejected — {reason}")
         seen.add(addr)
         return
 
+    symbol = pair.get("baseToken", {}).get("symbol", "???")
+
+    # Stage 2: base scoring from market data
+    score, breakdown = compute_base_score(pair, age_hours)
+
+    if score < GEM_THRESHOLD:
+        print(f"[score] {symbol} rejected — score {score} < {GEM_THRESHOLD}")
+        seen.add(addr)
+        return
+
+    # Stage 3: RugCheck on-chain safety
+    rugcheck = await fetch_rugcheck_report(session, addr)
+    print(f"[rugcheck] {symbol}: {_rugcheck_debug_line(rugcheck)}")
+    safety_delta, safety_breakdown, hard_fail = compute_safety_score(rugcheck)
+
+    if hard_fail:
+        print(f"[score] {symbol} rejected — RugCheck hard fail")
+        seen.add(addr)
+        return
+
+    score += safety_delta
+    breakdown += safety_breakdown
+    score = max(0, min(100, score))
+
+    # Add to spike watchlist
     liq = (pair.get("liquidity") or {}).get("usd") or 0
     if liq >= FILTERS["spike_min_liquidity"]:
         watchlist[addr] = pair
@@ -204,17 +340,38 @@ async def process_profile(
             watchlist.clear()
             watchlist.update(dict(sorted_wl[:FILTERS["watchlist_size"]]))
 
-    result = await send_gem_alert(session, {"pair": pair, "age_hours": age_hours, "source": source})
+    # Stage 4: route by score
+    if score >= ALPHA_THRESHOLD:
+        description = profile.get("description") or ""
+        result = await send_alpha_with_tldr(
+            session, pair, score, breakdown, rugcheck, age_hours, description
+        )
+        alpha_promoted.add(addr)
+        channel = "alpha"
+    else:
+        result = await send_gem_alert(
+            session,
+            {"pair": pair, "age_hours": age_hours, "source": source}
+        )
+        channel = "gems"
+
     seen.add(addr)
 
     if result in (200, 204):
-        symbol = pair.get("baseToken", {}).get("symbol", "???")
-        print(f"[alert] ✅ ${symbol.lstrip('$')} [{source}] | age={age_hours:.1f}h | liq=${liq:,.0f}")
+        db.record_alert(
+            addr, str(symbol).lstrip("$"), channel, _price_of(pair),
+            score=score, liquidity=liq,
+        )
+        print(
+            f"[alert] ✅ ${symbol.lstrip('$')} [{channel}] | "
+            f"score={score} | age={age_hours:.1f}h | liq=${liq:,.0f}"
+        )
         alerts_sent_ref[0] += 1
 
 
 async def scan_tokens(session: aiohttp.ClientSession):
     """Fetch new token profiles from both endpoints and process each."""
+    started = time.monotonic()
     print(f"[scan] {datetime.now().strftime('%H:%M:%S')} — scanning tokens...")
 
     chain = FILTERS["chain_id"]
@@ -246,19 +403,22 @@ async def scan_tokens(session: aiohttp.ClientSession):
         await process_profile(session, profile, source, alerts_sent_ref)
 
     cleaned = seen.cleanup()
-    print(f"[scan] Done. Alerts: {alerts_sent_ref[0]}, cleaned: {cleaned} entries")
+    elapsed = time.monotonic() - started
+    print(f"[scan] Done in {elapsed:.0f}s. Alerts: {alerts_sent_ref[0]}, cleaned: {cleaned} entries")
 
 
 async def scan_watchlist(session: aiohttp.ClientSession):
     """
-    Approach A: re-fetch watchlist tokens and compare vol.m5
-    to previous snapshot. Alert if spike_multiplier exceeded.
+    Watchlist pass with two jobs:
+    1. Volume spike detection (Approach A)
+    2. Re-scoring: promote matured tokens to #alpha-picks
     """
     if not watchlist:
         return
 
     print(f"[watchlist] Scanning {len(watchlist)} tokens...")
     spikes_found = 0
+    promotions = 0
     chain = FILTERS["chain_id"]
 
     for addr, _ in list(watchlist.items()):
@@ -282,36 +442,84 @@ async def scan_watchlist(session: aiohttp.ClientSession):
         vol_h1 = (pair.get("volume") or {}).get("h1") or 0
         liq = (pair.get("liquidity") or {}).get("usd") or 0
 
+        # Drop rugged tokens
         if liq < FILTERS["spike_min_liquidity"]:
             watchlist.pop(addr, None)
             continue
 
-        if vol_m5 < FILTERS["spike_min_vol_m5"]:
-            vol_history.set(addr, vol_m5, vol_h1)
-            continue
+        # Update stored pair snapshot
+        watchlist[addr] = pair
 
-        prev = vol_history.get(addr)
-
-        if prev is not None:
-            prev_vol_m5 = prev["vol_m5"]
-            if prev_vol_m5 > 0:
-                multiplier = vol_m5 / prev_vol_m5
-                if multiplier >= FILTERS["spike_multiplier"] and not seen_spikes.has(addr):
-                    symbol = pair.get("baseToken", {}).get("symbol", "???")
-                    print(f"[spike-A] {symbol} — {multiplier:.1f}x vol spike detected")
-                    await send_spike_alert(
-                        session,
-                        pair,
-                        spike_type="watchlist",
-                        prev_vol_m5=prev_vol_m5,
-                    )
-                    seen_spikes.add(addr)
-                    spikes_found += 1
+        # --- Job 1: volume spike detection ---
+        if vol_m5 >= FILTERS["spike_min_vol_m5"]:
+            prev = vol_history.get(addr)
+            if prev is not None:
+                prev_vol_m5 = prev["vol_m5"]
+                if prev_vol_m5 > 0:
+                    multiplier = vol_m5 / prev_vol_m5
+                    if multiplier >= FILTERS["spike_multiplier"] and not seen_spikes.has(addr):
+                        symbol = pair.get("baseToken", {}).get("symbol", "???")
+                        print(f"[spike-A] {symbol} — {multiplier:.1f}x vol spike detected")
+                        result = await send_spike_alert(
+                            session,
+                            pair,
+                            spike_type="watchlist",
+                            prev_vol_m5=prev_vol_m5,
+                        )
+                        if result in (200, 204):
+                            db.record_alert(
+                                addr, str(symbol).lstrip("$"), "spikes",
+                                _price_of(pair), liquidity=liq,
+                            )
+                        seen_spikes.add(addr)
+                        spikes_found += 1
 
         vol_history.set(addr, vol_m5, vol_h1)
 
+        # --- Job 2: re-score and promote to alpha ---
+        if alpha_promoted.has(addr):
+            continue
+
+        created_at = pair.get("pairCreatedAt")
+        age_hours = (time.time() - created_at / 1000) / 3600 if created_at else 999
+
+        score, breakdown = compute_base_score(pair, age_hours)
+
+        # Only spend a RugCheck call when the base score is close to alpha
+        if score < RESCORE_TRIGGER:
+            continue
+
+        rugcheck = await fetch_rugcheck_report(session, addr)
+        safety_delta, safety_breakdown, hard_fail = compute_safety_score(rugcheck)
+
+        if hard_fail:
+            watchlist.pop(addr, None)
+            continue
+
+        score += safety_delta
+        breakdown += safety_breakdown
+        score = max(0, min(100, score))
+
+        if score >= ALPHA_THRESHOLD:
+            symbol = pair.get("baseToken", {}).get("symbol", "???")
+            print(f"[promote] {symbol} matured to alpha — score={score}")
+            breakdown.append("🔄 Promoted from watchlist re-score")
+            result = await send_alpha_with_tldr(
+                session, pair, score, breakdown, rugcheck, age_hours
+            )
+            alpha_promoted.add(addr)
+            if result in (200, 204):
+                db.record_alert(
+                    addr, str(symbol).lstrip("$"), "alpha",
+                    _price_of(pair), score=score, liquidity=liq,
+                )
+                promotions += 1
+
     vol_history.cleanup()
-    print(f"[watchlist] Done. Spikes found: {spikes_found}, tracking: {len(watchlist)} tokens")
+    print(
+        f"[watchlist] Done. Spikes: {spikes_found}, promotions: {promotions}, "
+        f"tracking: {len(watchlist)} tokens"
+    )
 
 
 async def scan_narratives(session: aiohttp.ClientSession):
@@ -333,58 +541,36 @@ async def scan_narratives(session: aiohttp.ClientSession):
     print(f"[narratives] Sent {min(5, len(sorted_metas))} narratives")
 
 
-async def main_loop(session: aiohttp.ClientSession):
-    """Main polling loop — all scanners except liquidations."""
-    last_narrative = 0
-    last_watchlist = 0
-    last_funding = 0
-    last_boost = 0
-    last_takeover = 0
-    last_jupiter = 0
-    last_robinhood = 0
+async def run_periodic(
+    name: str,
+    interval_seconds: int,
+    fn,
+    session: aiohttp.ClientSession,
+    initial_delay: int = 0,
+):
+    """
+    Run a scan function forever with a true interval between runs.
+    Each scanner is an independent task — a slow scan in one
+    monitor never delays the others.
+    """
+    if initial_delay:
+        await asyncio.sleep(initial_delay)
 
     while True:
         try:
-            await scan_tokens(session)
-
-            if time.time() - last_robinhood >= ROBINHOOD_SCAN_INTERVAL_SECONDS:
-                await scan_robinhood(session)
-                last_robinhood = time.time()
-
-            if time.time() - last_watchlist >= WATCHLIST_SCAN_INTERVAL_SECONDS:
-                await scan_watchlist(session)
-                last_watchlist = time.time()
-
-            if time.time() - last_funding >= FUNDING_SCAN_INTERVAL_SECONDS:
-                await scan_funding(session)
-                last_funding = time.time()
-
-            if time.time() - last_boost >= BOOST_SCAN_INTERVAL_SECONDS:
-                await scan_boosts(session)
-                last_boost = time.time()
-
-            if time.time() - last_takeover >= TAKEOVER_SCAN_INTERVAL_SECONDS:
-                await scan_takeovers(session)
-                last_takeover = time.time()
-
-            if time.time() - last_jupiter >= JUPITER_SCAN_INTERVAL_SECONDS:
-                await scan_jupiter(session)
-                last_jupiter = time.time()
-
-            if time.time() - last_narrative >= NARRATIVE_INTERVAL_SECONDS:
-                await scan_narratives(session)
-                last_narrative = time.time()
-
+            await fn(session)
+        except asyncio.CancelledError:
+            print(f"[{name}] Task cancelled")
+            return
         except Exception as e:
-            print(f"[main] Unexpected error: {e}")
+            print(f"[{name}] Unexpected error: {e}")
 
-        print(f"[main] Waiting {SCAN_INTERVAL_SECONDS}s...\n")
-        await asyncio.sleep(SCAN_INTERVAL_SECONDS)
+        await asyncio.sleep(interval_seconds)
 
 
 async def main():
     print("=" * 50)
-    print("Trench Scanner — starting")
+    print("Trench Scanner — starting (parallel monitors)")
     print(f"Chain: {FILTERS['chain_id']} + robinhood")
     print(f"Scan interval: {SCAN_INTERVAL_SECONDS}s")
     print(f"Robinhood interval: {ROBINHOOD_SCAN_INTERVAL_SECONDS}s")
@@ -394,6 +580,10 @@ async def main():
     print(f"Takeover interval: {TAKEOVER_SCAN_INTERVAL_SECONDS}s")
     print(f"Jupiter interval: {JUPITER_SCAN_INTERVAL_SECONDS}s")
     print(f"Liquidations: WebSocket (real-time)")
+    print(f"Migrations: WebSocket (real-time)")
+    print(f"Performance tracking: every {PERF_TRACK_INTERVAL_SECONDS}s, report gated to 6h (restart-proof)")
+    print(f"Database: {db.DB_PATH}")
+    print(f"Alpha threshold: {ALPHA_THRESHOLD} | Gem threshold: {GEM_THRESHOLD}")
     print("=" * 50)
 
     required = [
@@ -406,6 +596,8 @@ async def main():
         "DISCORD_WEBHOOK_TAKEOVERS",
         "DISCORD_WEBHOOK_JUPITER",
         "DISCORD_WEBHOOK_ROBINHOOD",
+        "DISCORD_WEBHOOK_ALPHA",
+        "DISCORD_WEBHOOK_MIGRATIONS",
     ]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:
@@ -414,9 +606,21 @@ async def main():
     async with aiohttp.ClientSession(
         headers={"User-Agent": "TrenchScanner/1.0"}
     ) as session:
+        # Initial delays stagger the startup so all monitors don't
+        # hammer DexScreener at the same second.
         await asyncio.gather(
-            main_loop(session),
+            run_periodic("scan", SCAN_INTERVAL_SECONDS, scan_tokens, session),
+            run_periodic("watchlist", WATCHLIST_SCAN_INTERVAL_SECONDS, scan_watchlist, session, initial_delay=30),
+            run_periodic("robinhood", ROBINHOOD_SCAN_INTERVAL_SECONDS, scan_robinhood, session, initial_delay=10),
+            run_periodic("funding", FUNDING_SCAN_INTERVAL_SECONDS, scan_funding, session, initial_delay=5),
+            run_periodic("boost", BOOST_SCAN_INTERVAL_SECONDS, scan_boosts, session, initial_delay=15),
+            run_periodic("takeover", TAKEOVER_SCAN_INTERVAL_SECONDS, scan_takeovers, session, initial_delay=20),
+            run_periodic("jupiter", JUPITER_SCAN_INTERVAL_SECONDS, scan_jupiter, session, initial_delay=25),
+            run_periodic("narratives", NARRATIVE_INTERVAL_SECONDS, scan_narratives, session, initial_delay=40),
+            run_periodic("perf-track", PERF_TRACK_INTERVAL_SECONDS, track_performance, session, initial_delay=90),
+            run_periodic("perf-report", PERF_REPORT_POLL_SECONDS, maybe_send_performance_report, session, initial_delay=120),
             run_liquidation_monitor(session),
+            run_migration_monitor(session),
         )
 
 

@@ -2,3 +2,7 @@
 venv/
 __pycache__/
 *.pyc
+trench_scanner.db
+trench_scanner.db-shm
+trench_scanner.db-wal
+test_chart.png

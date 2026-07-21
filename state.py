@@ -2,11 +2,24 @@
 
 import time
 
+import db
+
 
 class SeenTokens:
-    def __init__(self, ttl_seconds: int):
+    """
+    TTL-based dedup store.
+    When `scope` is given, entries are persisted to SQLite and reloaded
+    on startup, so restarts don't cause a wave of duplicate alerts.
+    """
+
+    def __init__(self, ttl_seconds: int, scope: str | None = None):
         self.ttl = ttl_seconds
+        self.scope = scope
         self._store: dict[str, float] = {}
+        if scope:
+            self._store = db.load_seen(scope, ttl_seconds)
+            if self._store:
+                print(f"[state] Restored {len(self._store)} '{scope}' entries from DB")
 
     def has(self, address: str) -> bool:
         ts = self._store.get(address)
@@ -19,12 +32,16 @@ class SeenTokens:
 
     def add(self, address: str):
         self._store[address] = time.time()
+        if self.scope:
+            db.save_seen(self.scope, address)
 
     def cleanup(self):
         now = time.time()
         expired = [k for k, v in self._store.items() if now - v > self.ttl]
         for k in expired:
             del self._store[k]
+        if self.scope:
+            db.cleanup_seen(self.scope, self.ttl)
         return len(expired)
 
 
