@@ -42,6 +42,28 @@ MIN_JUPITER_VOLUME_1H = 10_000      # minimum 1h volume — a top-list entrant
 # tune on data
 CHART_MIN_VOLUME_1H = 150_000
 
+# --- Enrichment gate (rate-limit relief for the shared GeckoTerminal budget) ---
+# fetch_pool_only used to run on EVERY alert. With jupiter firing 4-8 alerts a
+# cycle — most of them $50-180k/24h churn (re-migrating USOH/USWR, TERMINAL,
+# MEEPCAT...) — those calls saturated the ~30/min gecko budget and, under the
+# resulting 429 storm, returned None anyway. So we were paying a rate-limit slot
+# per weak alert for a guaranteed 'n/a'. This gate skips the pool call for that
+# churn; the alert still goes out, just with unique-traders 'n/a' — exactly what
+# a 429 produced before. It cuts CALLS, not alerts.
+#
+# Two independent doors earn enrichment, because a token worth enriching comes
+# in two shapes and vol1h alone would wrongly drop the second:
+#   - fresh momentum  -> high 1h volume (a token pumping right now)
+#   - deep liquidity  -> high 24h volume (e.g. TIANA $2.1M/24h but only $86k/1h;
+#                        a vol1h-only gate would discard it — wrong)
+# "organic" entrants always enrich: wash/bot-filtered, strong by construction,
+# and they render a chart anyway (which needs the pool_address this call yields).
+#
+# Kept <= CHART_MIN_VOLUME_1H so any charted toptraded entrant (vol1h >= 150k)
+# has already enriched — no "chart without a pool" gap. Tune on data.
+ENRICH_MIN_VOLUME_1H = 100_000
+ENRICH_MIN_VOLUME_24H = 1_000_000
+
 alerted_jupiter: dict[str, float] = {}
 
 # Per-category previous top set — alert only on NEW entrants per category
@@ -210,6 +232,20 @@ def _extract_socials(token: dict) -> str | None:
     return ", ".join(parts) if parts else None
 
 
+def _should_enrich(entered: list[str], vol_1h: float, daily_volume: float) -> bool:
+    """
+    Decide whether an alert earns a GeckoTerminal pool call. See the
+    ENRICH_MIN_VOLUME_* comment above for the rationale: organic entrants and
+    both high-1h (fresh momentum) and high-24h (deep liquidity) tokens enrich;
+    mid-tier churn does not (it only ever got 'n/a' under the 429 storm anyway).
+    """
+    return (
+        ("organic" in entered)
+        or (vol_1h >= ENRICH_MIN_VOLUME_1H)
+        or (daily_volume >= ENRICH_MIN_VOLUME_24H)
+    )
+
+
 async def scan_jupiter(session: aiohttp.ClientSession):
     """
     Scan two Jupiter 1h leaderboards (top 50 each).
@@ -260,6 +296,7 @@ async def scan_jupiter(session: aiohttp.ClientSession):
 
     alerts_sent = 0
     skipped_quiet = 0
+    skipped_enrich = 0
 
     for addr, entry in new_entrants.items():
         token = entry["token"]
@@ -315,12 +352,19 @@ async def scan_jupiter(session: aiohttp.ClientSession):
         })
 
         # GeckoTerminal enrichment: one pool call gives unique traders +
-        # pool_address (fetched for EVERY alert). The OHLCV/chart call is the
-        # rate-limit valve — only spent on stronger signals (organic entry, or
-        # high 1h volume). Both are best-effort — any failure yields None and
-        # the alert still goes out (unique traders 'n/a', no chart). Solana
-        # network id is the stable string, so no resolve needed.
-        enrichment = await fetch_pool_only(session, GECKO_NETWORK, addr)
+        # pool_address. It is now GATED by _should_enrich — mid-tier churn
+        # skips the call (and its wasted rate-limit slot) and simply shows
+        # 'n/a', which is what the 429 storm produced for it anyway. The
+        # OHLCV/chart call remains the secondary valve on top (organic entry,
+        # or high 1h volume). Both are best-effort — any failure yields None
+        # and the alert still goes out. Solana network id is the stable
+        # string, so no resolve needed.
+        enrichment = None
+        if _should_enrich(entered, vol_1h, daily_volume):
+            enrichment = await fetch_pool_only(session, GECKO_NETWORK, addr)
+        else:
+            skipped_enrich += 1
+
         chart_png = None
         render_chart = ("organic" in entered) or (vol_1h >= CHART_MIN_VOLUME_1H)
         pool_addr = (enrichment or {}).get("pool_address")
@@ -352,4 +396,7 @@ async def scan_jupiter(session: aiohttp.ClientSession):
 
     _save_state()
     _cleanup_dedup()
-    print(f"[jupiter] Done. Alerts: {alerts_sent}, skipped quiet: {skipped_quiet}")
+    print(
+        f"[jupiter] Done. Alerts: {alerts_sent}, "
+        f"skipped quiet: {skipped_quiet}, enrich skipped: {skipped_enrich}"
+    )

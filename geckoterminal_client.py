@@ -5,10 +5,9 @@
 #   - token logo (image_url)
 #   - OHLCV candles for chart rendering
 #
-# Also under evaluation as a possibly-better data source for Robinhood Chain
-# (chain 4663), which GeckoTerminal indexes. Whether it actually beats
-# DexScreener there is verified empirically by the __main__ diagnostic below,
-# not assumed.
+# Also powers the multi-chain discovery monitor via trending_pools / new_pools,
+# which return buyers/sellers + reserve in the SAME response — so discovery on a
+# new chain costs one call per (chain, endpoint), no per-token enrichment call.
 #
 # Docs: https://apiguide.geckoterminal.com/  — RESTful JSON, versioned via
 # the Accept header. Rate limit 30/min, enforced globally here.
@@ -293,6 +292,149 @@ async def fetch_ohlcv(
         return None
     ohlcv_list = ((data.get("data") or {}).get("attributes") or {}).get("ohlcv_list")
     return ohlcv_list or None
+
+
+# ---------------------------------------------------------------------------
+# Multi-chain discovery: trending_pools / new_pools.
+#
+# Both endpoints return a LIST of pools, each already carrying reserve, volume,
+# price change AND unique buyers/sellers — the same enrichment fetch_pool_only
+# makes a separate call for. So one call here = full data for ~20 pools.
+#
+# The base/quote token addresses live in relationships (not attributes), as ids
+# shaped "{network}_{address}". Network ids never contain "_" (they use "-",
+# e.g. "sui-network"), so splitting on the first "_" is safe for EVM chains.
+# ---------------------------------------------------------------------------
+
+def _extract_token_address(token_id: str | None) -> str | None:
+    """
+    Pull the raw token address out of a relationships id like
+    'stable_0xeaf7...' -> '0xeaf7...'. Returns None if malformed.
+    """
+    if not token_id or "_" not in token_id:
+        return None
+    return token_id.split("_", 1)[1]
+
+
+def _parse_pool_name_symbols(name: str | None) -> tuple[str | None, str | None]:
+    """
+    Best-effort symbol extraction from a pool display name like
+    'FEFER / USDT0 1%' -> ('FEFER', 'USDT0'). The fee suffix (' 1%', ' 0.3%')
+    is stripped from the quote side. Returns (None, None) if unparseable.
+    """
+    if not name or "/" not in name:
+        return None, None
+    left, _, right = name.partition("/")
+    base_sym = left.strip() or None
+    # Quote side may carry a trailing fee tier token like "USDT0 1%".
+    quote_sym = right.strip().split(" ")[0] or None if right.strip() else None
+    return base_sym, quote_sym
+
+
+def _parse_discovery_pool(pool: dict, network: str) -> dict | None:
+    """
+    Parse one pool object from trending_pools / new_pools into a flat dict.
+    Includes BOTH sides of the pair (address + symbol) so the caller can decide
+    which token is the 'interesting' one (the meme), since the meme is sometimes
+    the quote token, not the base (e.g. 'WgUSDT / FEFER').
+    Every field defaults to None on absence — Beta API, schema drift tolerated.
+    """
+    if not isinstance(pool, dict):
+        return None
+    attrs = pool.get("attributes") or {}
+    rels = pool.get("relationships") or {}
+
+    def _f(d: dict, *path):
+        cur = d
+        for k in path:
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(k)
+        return cur
+
+    base_id = _f(rels, "base_token", "data", "id")
+    quote_id = _f(rels, "quote_token", "data", "id")
+    dex_id = _f(rels, "dex", "data", "id")
+
+    base_addr = _extract_token_address(base_id)
+    quote_addr = _extract_token_address(quote_id)
+    base_sym, quote_sym = _parse_pool_name_symbols(attrs.get("name"))
+
+    txns_h1 = _f(attrs, "transactions", "h1") or {}
+    txns_h24 = _f(attrs, "transactions", "h24") or {}
+
+    def _num(v):
+        try:
+            return float(v)
+        except (ValueError, TypeError):
+            return None
+
+    return {
+        "network": network,
+        "pool_address": attrs.get("address"),
+        "name": attrs.get("name"),
+        "dex_id": dex_id,
+        "base_address": base_addr,
+        "base_symbol": base_sym,
+        "quote_address": quote_addr,
+        "quote_symbol": quote_sym,
+        "price_usd": _num(attrs.get("base_token_price_usd")),
+        "fdv_usd": _num(attrs.get("fdv_usd")),
+        "market_cap_usd": _num(attrs.get("market_cap_usd")),
+        "reserve_usd": _num(attrs.get("reserve_in_usd")),
+        "volume_h1": _num(_f(attrs, "volume_usd", "h1")),
+        "volume_h6": _num(_f(attrs, "volume_usd", "h6")),
+        "volume_h24": _num(_f(attrs, "volume_usd", "h24")),
+        "price_change_h1": _num(_f(attrs, "price_change_percentage", "h1")),
+        "price_change_h6": _num(_f(attrs, "price_change_percentage", "h6")),
+        "price_change_h24": _num(_f(attrs, "price_change_percentage", "h24")),
+        "buys_h24": txns_h24.get("buys"),
+        "sells_h24": txns_h24.get("sells"),
+        "buyers_h1": txns_h1.get("buyers"),
+        "sellers_h1": txns_h1.get("sellers"),
+        "buyers_h24": txns_h24.get("buyers"),
+        "sellers_h24": txns_h24.get("sellers"),
+        "pool_created_at": attrs.get("pool_created_at"),
+    }
+
+
+async def fetch_trending_pools(
+    session: aiohttp.ClientSession,
+    network: str,
+) -> list[dict]:
+    """
+    Fetch trending pools for a network (what's moving NOW — the 'noise' signal).
+    Returns a list of parsed discovery-pool dicts (may be empty). One HTTP call.
+    Never raises: any failure yields [].
+    """
+    data = await _get(session, f"{API_BASE}/networks/{network}/trending_pools")
+    if not data or not data.get("data"):
+        return []
+    out = []
+    for pool in data["data"]:
+        parsed = _parse_discovery_pool(pool, network)
+        if parsed:
+            out.append(parsed)
+    return out
+
+
+async def fetch_new_pools(
+    session: aiohttp.ClientSession,
+    network: str,
+) -> list[dict]:
+    """
+    Fetch newly-created pools for a network (fresh launches). Returns a list of
+    parsed discovery-pool dicts (may be empty). One HTTP call. Never raises.
+    """
+    data = await _get(session, f"{API_BASE}/networks/{network}/new_pools")
+    if not data or not data.get("data"):
+        return []
+    out = []
+    for pool in data["data"]:
+        parsed = _parse_discovery_pool(pool, network)
+        if parsed:
+            out.append(parsed)
+    return out
 
 
 def format_unique_traders(enrichment: dict | None) -> str:

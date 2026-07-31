@@ -14,6 +14,7 @@ WEBHOOK_BOOSTED = os.environ["DISCORD_WEBHOOK_BOOSTED"]
 WEBHOOK_TAKEOVERS = os.environ["DISCORD_WEBHOOK_TAKEOVERS"]
 WEBHOOK_JUPITER = os.environ["DISCORD_WEBHOOK_JUPITER"]
 WEBHOOK_ALPHA = os.environ["DISCORD_WEBHOOK_ALPHA"]
+WEBHOOK_RADAR = os.environ["DISCORD_WEBHOOK_RADAR"]
 
 
 def _fmt_usd(value: float) -> str:
@@ -22,6 +23,15 @@ def _fmt_usd(value: float) -> str:
     if value >= 1_000:
         return f"${value/1_000:.1f}K"
     return f"${value:.0f}"
+
+
+def _fmt_px(px: float) -> str:
+    """Adaptive price formatting across BTC-scale and sub-cent assets."""
+    if px >= 1000:
+        return f"${px:,.2f}"
+    if px >= 1:
+        return f"${px:,.4f}"
+    return f"${px:.6f}"
 
 
 def _fmt_ratio(buys: int, sells: int) -> str:
@@ -367,6 +377,84 @@ async def send_liquidation_alert(session: aiohttp.ClientSession, data: dict):
         if resp.status not in (200, 204):
             text = await resp.text()
             print(f"[discord] Liquidation alert error: {resp.status} {text}")
+        return resp.status
+
+
+async def send_radar_alert(session: aiohttp.ClientSession, cluster: dict):
+    """
+    Liquidation cluster alert. Aggregated whale positions sitting near their
+    liquidation price form a zone that acts as a magnet for price:
+      - 'long'  cluster = zone BELOW price, forced sells if hit (downside flush)
+      - 'short' cluster = zone ABOVE price, forced buys if hit (squeeze up)
+    """
+    coin = cluster["coin"]
+    direction = cluster["direction"]
+    total_notional = cluster["total_notional"]
+    count = cluster["position_count"]
+    liq_low = cluster["liq_low"]
+    liq_high = cluster["liq_high"]
+    mark = cluster["mark_px"] or 0
+    largest = cluster["largest"]
+
+    if direction == "long":
+        setup = "⬇️ Downside magnet — long flush setup"
+        color = 0xFF0000
+        thesis = (
+            "Price may be pulled **DOWN** to harvest this liquidity.\n"
+            "→ Short toward the zone, or long the bounce after the flush."
+        )
+        # Zone sits below mark; nearest edge is liq_high.
+        near = (mark - liq_high) / mark if mark else 0
+        far = (mark - liq_low) / mark if mark else 0
+        dist_str = f"−{near*100:.1f}% to −{far*100:.1f}% below mark"
+    else:
+        setup = "⬆️ Upside magnet — short squeeze setup"
+        color = 0x00FF88
+        thesis = (
+            "Price may be pulled **UP** as shorts get squeezed.\n"
+            "→ Long momentum through the zone, or fade into the squeeze."
+        )
+        # Zone sits above mark; nearest edge is liq_low.
+        near = (liq_low - mark) / mark if mark else 0
+        far = (liq_high - mark) / mark if mark else 0
+        dist_str = f"+{near*100:.1f}% to +{far*100:.1f}% above mark"
+
+    zone_str = f"{_fmt_px(min(liq_low, liq_high))} – {_fmt_px(max(liq_low, liq_high))}"
+
+    lg_lev = largest.get("leverage")
+    lev_str = f"{lg_lev}x" if lg_lev else "?x"
+    largest_str = (
+        f"{_fmt_usd(largest['notional'])} {direction} @ {lev_str}, "
+        f"liq {_fmt_px(largest['liq_px'])}"
+    )
+
+    embed = {
+        "embeds": [{
+            "title": f"🎯 LIQUIDATION CLUSTER — {coin}",
+            "description": f"{setup}\n\n{thesis}",
+            "color": color,
+            "fields": [
+                {"name": "🎯 At-risk notional", "value": _fmt_usd(total_notional), "inline": True},
+                {"name": "📊 Positions in zone", "value": str(count), "inline": True},
+                {"name": "💵 Mark price", "value": _fmt_px(mark), "inline": True},
+                {"name": "💥 Liquidation zone", "value": zone_str, "inline": False},
+                {"name": "📍 Distance", "value": dist_str, "inline": False},
+                {"name": "🐋 Largest position", "value": largest_str, "inline": False},
+                {
+                    "name": "🔗 Trade",
+                    "value": f"[Hyperliquid](https://app.hyperliquid.xyz/trade/{coin})",
+                    "inline": True,
+                },
+            ],
+            "footer": {"text": "Trench Scanner • Liquidation Radar • DYOR"},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }]
+    }
+
+    async with session.post(WEBHOOK_RADAR, json=embed) as resp:
+        if resp.status not in (200, 204):
+            text = await resp.text()
+            print(f"[discord] Radar alert error: {resp.status} {text}")
         return resp.status
 
 

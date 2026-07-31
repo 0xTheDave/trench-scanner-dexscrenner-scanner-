@@ -19,11 +19,13 @@ from discord_client import (
 )
 from funding_monitor import scan_funding
 from liquidation_monitor import run_liquidation_monitor
+from whale_radar_monitor import run_whale_radar_monitor
 from boost_monitor import scan_boosts
 from community_takeover_monitor import scan_takeovers
 from jupiter_monitor import scan_jupiter
 from robinhood_monitor import scan_robinhood
 from migration_monitor import run_migration_monitor
+from multichain_monitor import scan_multichain  # NEW
 from performance_tracker import track_performance, maybe_send_performance_report
 from scoring import (
     compute_base_score,
@@ -45,6 +47,7 @@ BOOST_SCAN_INTERVAL_SECONDS = 300
 TAKEOVER_SCAN_INTERVAL_SECONDS = 300
 JUPITER_SCAN_INTERVAL_SECONDS = 300
 ROBINHOOD_SCAN_INTERVAL_SECONDS = 120
+MULTICHAIN_SCAN_INTERVAL_SECONDS = 60  # NEW: 4 chains x 2 endpoints = 8 req/cycle
 PERF_TRACK_INTERVAL_SECONDS = 600
 # Poll often; the actual report cadence is gated inside
 # maybe_send_performance_report via a DB timestamp (restart-proof), so this is
@@ -579,7 +582,9 @@ async def main():
     print(f"Boost interval: {BOOST_SCAN_INTERVAL_SECONDS}s")
     print(f"Takeover interval: {TAKEOVER_SCAN_INTERVAL_SECONDS}s")
     print(f"Jupiter interval: {JUPITER_SCAN_INTERVAL_SECONDS}s")
+    print(f"Multichain interval: {MULTICHAIN_SCAN_INTERVAL_SECONDS}s")  # NEW
     print(f"Liquidations: WebSocket (real-time)")
+    print(f"Liquidation radar: whale position polling (60s)")
     print(f"Migrations: WebSocket (real-time)")
     print(f"Performance tracking: every {PERF_TRACK_INTERVAL_SECONDS}s, report gated to 6h (restart-proof)")
     print(f"Database: {db.DB_PATH}")
@@ -598,6 +603,8 @@ async def main():
         "DISCORD_WEBHOOK_ROBINHOOD",
         "DISCORD_WEBHOOK_ALPHA",
         "DISCORD_WEBHOOK_MIGRATIONS",
+        "DISCORD_WEBHOOK_RADAR",
+        "DISCORD_WEBHOOK_MULTICHAIN",  # NEW
     ]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:
@@ -616,11 +623,13 @@ async def main():
             run_periodic("boost", BOOST_SCAN_INTERVAL_SECONDS, scan_boosts, session, initial_delay=15),
             run_periodic("takeover", TAKEOVER_SCAN_INTERVAL_SECONDS, scan_takeovers, session, initial_delay=20),
             run_periodic("jupiter", JUPITER_SCAN_INTERVAL_SECONDS, scan_jupiter, session, initial_delay=25),
+            run_periodic("multichain", MULTICHAIN_SCAN_INTERVAL_SECONDS, scan_multichain, session, initial_delay=45),  # NEW
             run_periodic("narratives", NARRATIVE_INTERVAL_SECONDS, scan_narratives, session, initial_delay=40),
             run_periodic("perf-track", PERF_TRACK_INTERVAL_SECONDS, track_performance, session, initial_delay=90),
             run_periodic("perf-report", PERF_REPORT_POLL_SECONDS, maybe_send_performance_report, session, initial_delay=120),
             run_liquidation_monitor(session),
             run_migration_monitor(session),
+            run_whale_radar_monitor(session),
         )
 
 
