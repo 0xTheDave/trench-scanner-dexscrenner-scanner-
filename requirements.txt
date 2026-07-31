@@ -2,4 +2,4 @@ aiohttp==3.9.5
 mplfinance
 pandas
 matplotlib
-
+python-dotenv
