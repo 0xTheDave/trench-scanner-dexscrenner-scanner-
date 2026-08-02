@@ -4,13 +4,23 @@
 #   - unique buyers/sellers (wallet-level, not raw txn counts)
 #   - token logo (image_url)
 #   - OHLCV candles for chart rendering
+#   - trending / new pool discovery across chains (multichain_monitor)
 #
-# Also powers the multi-chain discovery monitor via trending_pools / new_pools,
-# which return buyers/sellers + reserve in the SAME response — so discovery on a
-# new chain costs one call per (chain, endpoint), no per-token enrichment call.
+# Also under evaluation as a possibly-better data source for Robinhood Chain
+# (chain 4663), which GeckoTerminal indexes. Whether it actually beats
+# DexScreener there is verified empirically by the __main__ diagnostic below,
+# not assumed.
 #
 # Docs: https://apiguide.geckoterminal.com/  — RESTful JSON, versioned via
 # the Accept header. Rate limit 30/min, enforced globally here.
+#
+# NOTE ON NUMERIC FIELDS: GeckoTerminal returns most numeric attributes
+# (reserve_in_usd, base_token_price_usd, volume_usd.*, price_change_percentage.*)
+# as STRINGS. Both parsers below coerce them to float at the source, so every
+# consumer (multichain floors/embeds, jupiter liquidity instrumentation, chart
+# paths) can rely on numbers. A raw string reaching an f-string ':f' format was
+# crashing multichain mid-scan ("Unknown format code 'f' for object of type
+# 'str'") and would have silently stored string liquidity in the DB.
 
 import asyncio
 import aiohttp
@@ -46,6 +56,18 @@ _MIN_RATE_LIMIT_BACKOFF = 3.0
 # numeric chain ids. We resolve Robinhood's id once by scanning the networks
 # list, since it's not guaranteed to be a predictable string.
 _network_id_cache: dict[str, str] = {}
+
+
+def _to_float(v):
+    """
+    Coerce a GeckoTerminal numeric-as-string value to float.
+    Returns None when the value is absent or not a number — callers decide
+    whether None means 'n/a' or falls back to 0.
+    """
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None
 
 
 def _trip_cooldown():
@@ -154,10 +176,7 @@ def _pick_best_pool(pools: list) -> dict | None:
     valid = []
     for p in pools:
         attrs = p.get("attributes") or {}
-        try:
-            reserve = float(attrs.get("reserve_in_usd") or 0)
-        except (ValueError, TypeError):
-            reserve = 0.0
+        reserve = _to_float(attrs.get("reserve_in_usd")) or 0.0
         if reserve > 0:
             valid.append((reserve, p))
     if not valid:
@@ -169,6 +188,9 @@ def _parse_pool(pool: dict) -> dict | None:
     """
     Extract the fields we care about from a GeckoTerminal pool object.
     Defensive: every field defaults to None if absent (Beta API, schema drift).
+    Numeric fields are coerced to float here — the API sends them as strings.
+    This matters downstream: jupiter's _extract_liquidity stores reserve_usd in
+    the DB for liquidity-band analysis, which needs real numbers, not strings.
     """
     if not isinstance(pool, dict):
         return None
@@ -188,11 +210,11 @@ def _parse_pool(pool: dict) -> dict | None:
     return {
         "pool_address": attrs.get("address"),
         "name": attrs.get("name"),
-        "price_usd": attrs.get("base_token_price_usd"),
-        "price_change_h1": _f(attrs, "price_change_percentage", "h1"),
-        "price_change_h24": _f(attrs, "price_change_percentage", "h24"),
-        "volume_h24": _f(attrs, "volume_usd", "h24"),
-        "reserve_usd": attrs.get("reserve_in_usd"),
+        "price_usd": _to_float(attrs.get("base_token_price_usd")),
+        "price_change_h1": _to_float(_f(attrs, "price_change_percentage", "h1")),
+        "price_change_h24": _to_float(_f(attrs, "price_change_percentage", "h24")),
+        "volume_h24": _to_float(_f(attrs, "volume_usd", "h24")),
+        "reserve_usd": _to_float(attrs.get("reserve_in_usd")),
         # The genuinely-additive bit vs DexScreener: unique wallets, not txn counts.
         "buyers_h1": txns_h1.get("buyers"),
         "sellers_h1": txns_h1.get("sellers"),
@@ -294,149 +316,6 @@ async def fetch_ohlcv(
     return ohlcv_list or None
 
 
-# ---------------------------------------------------------------------------
-# Multi-chain discovery: trending_pools / new_pools.
-#
-# Both endpoints return a LIST of pools, each already carrying reserve, volume,
-# price change AND unique buyers/sellers — the same enrichment fetch_pool_only
-# makes a separate call for. So one call here = full data for ~20 pools.
-#
-# The base/quote token addresses live in relationships (not attributes), as ids
-# shaped "{network}_{address}". Network ids never contain "_" (they use "-",
-# e.g. "sui-network"), so splitting on the first "_" is safe for EVM chains.
-# ---------------------------------------------------------------------------
-
-def _extract_token_address(token_id: str | None) -> str | None:
-    """
-    Pull the raw token address out of a relationships id like
-    'stable_0xeaf7...' -> '0xeaf7...'. Returns None if malformed.
-    """
-    if not token_id or "_" not in token_id:
-        return None
-    return token_id.split("_", 1)[1]
-
-
-def _parse_pool_name_symbols(name: str | None) -> tuple[str | None, str | None]:
-    """
-    Best-effort symbol extraction from a pool display name like
-    'FEFER / USDT0 1%' -> ('FEFER', 'USDT0'). The fee suffix (' 1%', ' 0.3%')
-    is stripped from the quote side. Returns (None, None) if unparseable.
-    """
-    if not name or "/" not in name:
-        return None, None
-    left, _, right = name.partition("/")
-    base_sym = left.strip() or None
-    # Quote side may carry a trailing fee tier token like "USDT0 1%".
-    quote_sym = right.strip().split(" ")[0] or None if right.strip() else None
-    return base_sym, quote_sym
-
-
-def _parse_discovery_pool(pool: dict, network: str) -> dict | None:
-    """
-    Parse one pool object from trending_pools / new_pools into a flat dict.
-    Includes BOTH sides of the pair (address + symbol) so the caller can decide
-    which token is the 'interesting' one (the meme), since the meme is sometimes
-    the quote token, not the base (e.g. 'WgUSDT / FEFER').
-    Every field defaults to None on absence — Beta API, schema drift tolerated.
-    """
-    if not isinstance(pool, dict):
-        return None
-    attrs = pool.get("attributes") or {}
-    rels = pool.get("relationships") or {}
-
-    def _f(d: dict, *path):
-        cur = d
-        for k in path:
-            if not isinstance(cur, dict):
-                return None
-            cur = cur.get(k)
-        return cur
-
-    base_id = _f(rels, "base_token", "data", "id")
-    quote_id = _f(rels, "quote_token", "data", "id")
-    dex_id = _f(rels, "dex", "data", "id")
-
-    base_addr = _extract_token_address(base_id)
-    quote_addr = _extract_token_address(quote_id)
-    base_sym, quote_sym = _parse_pool_name_symbols(attrs.get("name"))
-
-    txns_h1 = _f(attrs, "transactions", "h1") or {}
-    txns_h24 = _f(attrs, "transactions", "h24") or {}
-
-    def _num(v):
-        try:
-            return float(v)
-        except (ValueError, TypeError):
-            return None
-
-    return {
-        "network": network,
-        "pool_address": attrs.get("address"),
-        "name": attrs.get("name"),
-        "dex_id": dex_id,
-        "base_address": base_addr,
-        "base_symbol": base_sym,
-        "quote_address": quote_addr,
-        "quote_symbol": quote_sym,
-        "price_usd": _num(attrs.get("base_token_price_usd")),
-        "fdv_usd": _num(attrs.get("fdv_usd")),
-        "market_cap_usd": _num(attrs.get("market_cap_usd")),
-        "reserve_usd": _num(attrs.get("reserve_in_usd")),
-        "volume_h1": _num(_f(attrs, "volume_usd", "h1")),
-        "volume_h6": _num(_f(attrs, "volume_usd", "h6")),
-        "volume_h24": _num(_f(attrs, "volume_usd", "h24")),
-        "price_change_h1": _num(_f(attrs, "price_change_percentage", "h1")),
-        "price_change_h6": _num(_f(attrs, "price_change_percentage", "h6")),
-        "price_change_h24": _num(_f(attrs, "price_change_percentage", "h24")),
-        "buys_h24": txns_h24.get("buys"),
-        "sells_h24": txns_h24.get("sells"),
-        "buyers_h1": txns_h1.get("buyers"),
-        "sellers_h1": txns_h1.get("sellers"),
-        "buyers_h24": txns_h24.get("buyers"),
-        "sellers_h24": txns_h24.get("sellers"),
-        "pool_created_at": attrs.get("pool_created_at"),
-    }
-
-
-async def fetch_trending_pools(
-    session: aiohttp.ClientSession,
-    network: str,
-) -> list[dict]:
-    """
-    Fetch trending pools for a network (what's moving NOW — the 'noise' signal).
-    Returns a list of parsed discovery-pool dicts (may be empty). One HTTP call.
-    Never raises: any failure yields [].
-    """
-    data = await _get(session, f"{API_BASE}/networks/{network}/trending_pools")
-    if not data or not data.get("data"):
-        return []
-    out = []
-    for pool in data["data"]:
-        parsed = _parse_discovery_pool(pool, network)
-        if parsed:
-            out.append(parsed)
-    return out
-
-
-async def fetch_new_pools(
-    session: aiohttp.ClientSession,
-    network: str,
-) -> list[dict]:
-    """
-    Fetch newly-created pools for a network (fresh launches). Returns a list of
-    parsed discovery-pool dicts (may be empty). One HTTP call. Never raises.
-    """
-    data = await _get(session, f"{API_BASE}/networks/{network}/new_pools")
-    if not data or not data.get("data"):
-        return []
-    out = []
-    for pool in data["data"]:
-        parsed = _parse_discovery_pool(pool, network)
-        if parsed:
-            out.append(parsed)
-    return out
-
-
 def format_unique_traders(enrichment: dict | None) -> str:
     """Short label for unique buyers/sellers. 'n/a' when data missing."""
     if not enrichment:
@@ -446,6 +325,169 @@ def format_unique_traders(enrichment: dict | None) -> str:
     if b is None and s is None:
         return "n/a"
     return f"{b if b is not None else '?'} buyers / {s if s is not None else '?'} sellers (1h)"
+
+
+# ---------------------------------------------------------------------------
+# Multi-chain pool discovery (trending + new pools) for multichain_monitor.
+#
+# Different response SHAPE from the single-token /pools path above, so it needs
+# its own parser (_parse_discovery_pool), NOT _parse_pool:
+#   - base/quote token symbol+address are NOT in the pool's own attributes.
+#     They live in the top-level "included" array and must be requested via
+#     ?include=base_token,quote_token,dex (verified against GeckoTerminal API
+#     docs: attributes named in `include` are returned under the top-level
+#     `included` key). Each pool's `relationships` holds the ids that index
+#     into `included`.
+#   - multichain_monitor needs BOTH sides of the pair (base_address/base_symbol,
+#     quote_address/quote_symbol) so _select_interesting can pick the non-boring
+#     side. _parse_pool never exposed those — hence this separate parser that
+#     returns the FLAT dict shape multichain_monitor._passes/_select_interesting
+#     /_send_alert read from.
+# Endpoints: /networks/{network}/trending_pools and /new_pools, up to 20 pools.
+# ---------------------------------------------------------------------------
+
+def _index_included(included: list) -> tuple[dict, dict]:
+    """
+    Build {id: attributes} lookup maps from the response's top-level `included`
+    array, split by resource type. Returns (tokens_by_id, dexes_by_id).
+    `included` mixes types ("token", "dex"); each entry is keyed by its own id
+    (e.g. "base_0x...", the same id the pool's relationships reference).
+    """
+    tokens_by_id: dict[str, dict] = {}
+    dexes_by_id: dict[str, dict] = {}
+    for item in included or []:
+        if not isinstance(item, dict):
+            continue
+        item_id = item.get("id")
+        item_type = item.get("type")
+        attrs = item.get("attributes") or {}
+        if not item_id:
+            continue
+        if item_type == "token":
+            tokens_by_id[item_id] = attrs
+        elif item_type == "dex":
+            dexes_by_id[item_id] = attrs
+    return tokens_by_id, dexes_by_id
+
+
+def _related_id(pool: dict, rel_name: str) -> str | None:
+    """Pull a related resource's id from a pool's relationships block."""
+    rel = ((pool.get("relationships") or {}).get(rel_name) or {}).get("data") or {}
+    return rel.get("id")
+
+
+def _parse_discovery_pool(
+    pool: dict,
+    tokens_by_id: dict,
+    dexes_by_id: dict,
+    network: str,
+) -> dict | None:
+    """
+    Parse ONE pool from a trending_pools / new_pools response into the flat dict
+    shape multichain_monitor expects. Resolves base/quote token symbol+address
+    from the `included` maps via the pool's relationships. Every field defaults
+    to None/0 defensively (Beta API, schema drift). Returns None if the pool has
+    no usable base token id at all.
+    ALL numeric fields are coerced via _to_float — the API sends them as
+    strings, and a raw string reaching _fmt_pct's ':+.1f' was killing the
+    Base/Stable scans mid-pass.
+    """
+    if not isinstance(pool, dict):
+        return None
+    attrs = pool.get("attributes") or {}
+
+    def _f(d: dict, *path):
+        cur = d
+        for k in path:
+            if not isinstance(cur, dict):
+                return None
+            cur = cur.get(k)
+        return cur
+
+    base_id = _related_id(pool, "base_token")
+    quote_id = _related_id(pool, "quote_token")
+    dex_id_ref = _related_id(pool, "dex")
+
+    base_attrs = tokens_by_id.get(base_id or "", {})
+    quote_attrs = tokens_by_id.get(quote_id or "", {})
+    dex_attrs = dexes_by_id.get(dex_id_ref or "", {})
+
+    txns_h1 = _f(attrs, "transactions", "h1") or {}
+    txns_h24 = _f(attrs, "transactions", "h24") or {}
+
+    return {
+        "network": network,
+        "pool_address": attrs.get("address"),
+        "name": attrs.get("name"),
+        "dex_id": dex_attrs.get("name") or dex_id_ref,
+        # Both sides of the pair — the whole point of this parser.
+        "base_address": base_attrs.get("address"),
+        "base_symbol": base_attrs.get("symbol"),
+        "quote_address": quote_attrs.get("address"),
+        "quote_symbol": quote_attrs.get("symbol"),
+        # Market data (base_token_price_usd is the pool's own attribute).
+        "price_usd": _to_float(attrs.get("base_token_price_usd")),
+        "price_change_h1": _to_float(_f(attrs, "price_change_percentage", "h1")),
+        "price_change_h24": _to_float(_f(attrs, "price_change_percentage", "h24")),
+        "volume_h24": _to_float(_f(attrs, "volume_usd", "h24")) or 0,
+        "reserve_usd": _to_float(attrs.get("reserve_in_usd")) or 0,
+        "market_cap_usd": _to_float(attrs.get("market_cap_usd")),
+        "fdv_usd": _to_float(attrs.get("fdv_usd")),
+        # Unique wallets — the genuinely-additive discovery signal.
+        "buyers_h1": txns_h1.get("buyers"),
+        "sellers_h1": txns_h1.get("sellers"),
+        "buyers_h24": txns_h24.get("buyers"),
+        "sellers_h24": txns_h24.get("sellers"),
+    }
+
+
+async def _fetch_discovery(
+    session: aiohttp.ClientSession,
+    network: str,
+    endpoint: str,
+) -> list[dict]:
+    """
+    Shared fetch+parse for trending_pools / new_pools. Requests base_token,
+    quote_token and dex under `included` so the parser can resolve pair sides.
+    Returns a list of flat pool dicts (possibly empty); never raises.
+    """
+    url = (
+        f"{API_BASE}/networks/{network}/{endpoint}"
+        f"?include=base_token,quote_token,dex"
+    )
+    data = await _get(session, url)
+    if not data or not data.get("data"):
+        return []
+    tokens_by_id, dexes_by_id = _index_included(data.get("included") or [])
+    out: list[dict] = []
+    for pool in data["data"]:
+        parsed = _parse_discovery_pool(pool, tokens_by_id, dexes_by_id, network)
+        if parsed and parsed.get("base_address"):
+            out.append(parsed)
+    return out
+
+
+async def fetch_trending_pools(
+    session: aiohttp.ClientSession,
+    network: str,
+) -> list[dict]:
+    """
+    Trending pools on a network (GeckoTerminal's own trending ranking, web
+    visits + on-chain activity). One HTTP call, up to 20 pools, flat dicts.
+    Returns [] on any failure — multichain_monitor treats [] as "quiet chain".
+    """
+    return await _fetch_discovery(session, network, "trending_pools")
+
+
+async def fetch_new_pools(
+    session: aiohttp.ClientSession,
+    network: str,
+) -> list[dict]:
+    """
+    Newest pools on a network (freshly created). One HTTP call, up to 20 pools,
+    flat dicts. Returns [] on any failure.
+    """
+    return await _fetch_discovery(session, network, "new_pools")
 
 
 # ---------------------------------------------------------------------------

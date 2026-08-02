@@ -64,6 +64,20 @@ CHART_MIN_VOLUME_1H = 150_000
 ENRICH_MIN_VOLUME_1H = 100_000
 ENRICH_MIN_VOLUME_24H = 1_000_000
 
+# --- Performance-tracking instrumentation (encoded into the unused `score`
+# column of the alerts table, so no DB schema change is needed) ---
+# Jupiter never computes a real score, so we repurpose that column to record
+# WHICH leaderboard the token entered on — the single most useful dimension
+# for retroactive analysis that we were previously blind to:
+#   2 = organic entry (token was on the wash/bot-filtered organic list;
+#       if it entered BOTH lists it still counts as organic — the stronger
+#       signal by construction)
+#   1 = toptraded-only entry (raw volume, may include wash trading)
+# analyze_alerts.py can then split jupiter performance by `score` (2 vs 1)
+# to answer "does organic actually outperform toptraded?" — untestable today.
+ENTRY_SOURCE_ORGANIC = 2
+ENTRY_SOURCE_TOPTRADED = 1
+
 alerted_jupiter: dict[str, float] = {}
 
 # Per-category previous top set — alert only on NEW entrants per category
@@ -232,6 +246,38 @@ def _extract_socials(token: dict) -> str | None:
     return ", ".join(parts) if parts else None
 
 
+def _extract_liquidity(enrichment: dict | None) -> float | None:
+    """
+    USD liquidity from a GeckoTerminal pool enrichment, for performance
+    tracking (so jupiter alerts stop landing in the 'unknown' liquidity band).
+    fetch_pool_only -> _parse_pool exposes pool depth under the single key
+    'reserve_usd' (mapped from GeckoTerminal's 'reserve_in_usd'). Returns None
+    when enrichment was skipped by the gate or the field is absent — None is
+    correct, it leaves liquidity_at_alert NULL exactly as today rather than
+    recording a wrong 0.0.
+    """
+    if not enrichment:
+        return None
+    val = enrichment.get("reserve_usd")
+    if not val:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _entry_source_code(entered: list[str]) -> int:
+    """
+    Encode which leaderboard the token entered, into the alerts.score column
+    (unused by jupiter otherwise). Organic entry — even alongside toptraded —
+    counts as organic, the stronger signal. See ENTRY_SOURCE_* constants.
+    """
+    if "organic" in entered:
+        return ENTRY_SOURCE_ORGANIC
+    return ENTRY_SOURCE_TOPTRADED
+
+
 def _should_enrich(entered: list[str], vol_1h: float, daily_volume: float) -> bool:
     """
     Decide whether an alert earns a GeckoTerminal pool call. See the
@@ -382,14 +428,28 @@ async def scan_jupiter(session: aiohttp.ClientSession):
             "chart_png": chart_png,
         })
 
-        # Record for performance tracking (needs a numeric entry price)
+        # Record for performance tracking (needs a numeric entry price).
+        # Now also records liquidity (from the pool enrichment, when the gate
+        # let it run) and encodes the entry source (organic vs toptraded) into
+        # the score column — so analyze_alerts.py can finally split jupiter
+        # performance by liquidity band and by source. Both default to
+        # None/toptraded when data is absent, never to a wrong value.
         alert_price = 0.0
         if price_data:
             try:
                 alert_price = float(price_data.get("usdPrice") or price_data.get("price") or 0)
             except (ValueError, TypeError):
                 alert_price = 0.0
-        db.record_alert(addr, symbol, "jupiter", alert_price)
+        liquidity_at_alert = _extract_liquidity(enrichment)
+        entry_source = _entry_source_code(entered)
+        db.record_alert(
+            addr,
+            symbol,
+            "jupiter",
+            alert_price,
+            score=entry_source,
+            liquidity=liquidity_at_alert,
+        )
 
         _mark_alerted(addr)
         alerts_sent += 1
