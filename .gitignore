@@ -7,3 +7,6 @@ trench_scanner.db-shm
 trench_scanner.db-wal
 test_chart.png
 audit/
+*.bak
+*.odzyskany
+audit/

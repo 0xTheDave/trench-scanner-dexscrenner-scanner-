@@ -14,6 +14,7 @@ from geckoterminal_client import (
     fetch_pool_only,
     fetch_ohlcv,
     format_unique_traders,
+    format_pool_selection,
 )
 from chart_renderer import render_chart_async
 
@@ -21,20 +22,29 @@ DEXSCREENER_BASE = "https://api.dexscreener.com"
 WEBHOOK_ROBINHOOD = os.environ.get("DISCORD_WEBHOOK_ROBINHOOD", "")
 
 # Expected chainId string on DexScreener — verified via chain page URL.
-# If no tokens ever match, check the [robinhood] chainIds log line below.
 ROBINHOOD_CHAIN_ID = "robinhood"
 
-# GeckoTerminal network id for Robinhood Chain — resolved once at first use
-# (confirmed 'robinhood' via diagnostic, but resolved live in case it changes).
+# GeckoTerminal network id for Robinhood Chain — resolved once at first use.
 _gecko_network_id: str | None = None
 _gecko_network_resolved = False
 
-# Rate-limit valve: unique-traders (the pool call) runs for every alert, but
-# the OHLCV/chart call (the 2nd gecko call) is only spent on stronger movers,
-# to keep total GeckoTerminal load well under the ~30/min ceiling. Loosen these
-# once 429s are gone if you want charts on more alerts. tune on data
+# Rate-limit valve: the pool call runs for every alert, the OHLCV/chart call
+# only for stronger movers, to keep GeckoTerminal load under the ceiling.
 CHART_MIN_CH_H1 = 30.0
 CHART_MIN_VOL_H24 = 100_000
+
+# Pool pinning, added 2026-09-05.
+#   Alerts now persist the GeckoTerminal pool the enrichment came from, so
+#   performance_tracker can measure the SAME pool later instead of re-picking
+#   by max(liquidity) at measurement time. Until this shipped, db_return_1h for
+#   this channel measured an unknown pool and could not be used as an outcome
+#   variable (median divergence +111.6pp, gaps to +/-1300pp).
+#
+#   REQUIRE_TRADEABLE_POOL stays False for the first deployment: we collect the
+#   pin and the pipeline latency, we do NOT reject alerts. Rejection gets turned
+#   on only once the logged data justifies it. Turning this True without that
+#   evidence would silence alerts on a rule validated by n=1 candidate.
+REQUIRE_TRADEABLE_POOL = False
 
 # Robinhood Chain is brand new — thresholds are looser than Solana filters
 RH_FILTERS = {
@@ -53,6 +63,21 @@ RH_FILTERS = {
 
 seen_robinhood: dict[str, float] = {}
 _logged_chain_ids = False  # log available chainIds once for verification
+
+# Session counters for the two open questions from the pool-selection work.
+# Printed once per scan so the answers accumulate in the normal logs instead of
+# requiring another 460-request historical reconstruction.
+_pool_stats = {
+    "alerts": 0,
+    "sole_candidate": 0,     # only one pool had any volume -> rule did not choose
+    "multi_candidate": 0,    # rule actually discriminated between pools
+    "method_h1": 0,
+    "method_h24": 0,
+    "method_reserve": 0,
+    "method_fallback": 0,
+    "dex_gecko_match": 0,    # DexScreener pair == GeckoTerminal pool
+    "dex_gecko_mismatch": 0,
+}
 
 
 def _is_deduped(address: str) -> bool:
@@ -82,8 +107,8 @@ def _cleanup():
 async def _get_gecko_network_id(session: aiohttp.ClientSession) -> str | None:
     """
     Lazily resolve (and cache) GeckoTerminal's network id for Robinhood Chain.
-    Resolved once per process. Returns None if GeckoTerminal doesn't expose it —
-    in which case enrichment is simply skipped, never an error.
+    Returns None if GeckoTerminal doesn't expose it — enrichment is then simply
+    skipped, never an error.
     """
     global _gecko_network_id, _gecko_network_resolved
     if _gecko_network_resolved:
@@ -224,6 +249,41 @@ def _passes_filters(pair: dict, age_hours: float) -> tuple[bool, str]:
     return True, ""
 
 
+def _record_alert_compat(
+    addr: str,
+    symbol: str,
+    price: float,
+    liquidity: float,
+    pool_address: str | None,
+    priced_at: float | None,
+    alert_sent_at: float | None,
+):
+    """
+    Persist the alert with the pinned pool and the pipeline timestamps.
+
+    db.record_alert gained these parameters in the 09-04b migration. If this
+    module is ever run against an older db.py the extended call raises
+    TypeError; we then fall back to the original signature and say so loudly,
+    rather than losing the alert. The fallback is a degraded path, not a normal
+    one — a warning here means the pin is silently not being stored.
+    """
+    try:
+        db.record_alert(
+            addr, symbol, "robinhood", price,
+            liquidity=liquidity,
+            pool_address=pool_address,
+            priced_at=priced_at,
+            alert_sent_at=alert_sent_at,
+        )
+        return True
+    except TypeError:
+        db.record_alert(addr, symbol, "robinhood", price, liquidity=liquidity)
+        print("[robinhood] WARNING: db.record_alert does not accept pool_address/"
+              "priced_at/alert_sent_at — alert stored WITHOUT the pin. "
+              "Pool pinning is inactive until db.py is updated.")
+        return False
+
+
 async def _send_robinhood_alert(
     session: aiohttp.ClientSession,
     pair: dict,
@@ -279,6 +339,8 @@ async def _send_robinhood_alert(
         {"name": "🔄 Buy/Sell ratio", "value": _fmt_ratio(buys, sells), "inline": False},
         # GeckoTerminal enrichment: unique wallets, not raw txn counts — exposes
         # bot-inflated buy ratios that DexScreener's %-buys alone would hide.
+        # Since 09-05 these come from the volume-ranked pool, not from whatever
+        # pool GeckoTerminal happened to list first.
         {"name": "👥 Unique traders (1h)", "value": format_unique_traders(enrichment), "inline": False},
         {"name": "📉 Vol/Liq ratio", "value": f"{vol_liq_ratio:.1f}x", "inline": True},
         {"name": "🏷️ Type", "value": _fmt_token_type(classification), "inline": False},
@@ -315,12 +377,26 @@ async def _send_robinhood_alert(
                 print(f"[robinhood] Discord send error (multipart): {resp.status} {text}")
             return resp.status
 
-    # No chart -> plain JSON send (fresh token, no OHLCV, or fetch failed)
     async with session.post(WEBHOOK_ROBINHOOD, json={"embeds": [embed]}) as resp:
         if resp.status not in (200, 204):
             text = await resp.text()
             print(f"[robinhood] Discord send error: {resp.status} {text}")
         return resp.status
+
+
+def _log_pool_stats():
+    """Per-scan summary of how pool selection actually behaved."""
+    s = _pool_stats
+    if s["alerts"] == 0:
+        return
+    print(
+        f"[robinhood] pool-selection: alerts={s['alerts']} "
+        f"sole={s['sole_candidate']} multi={s['multi_candidate']} | "
+        f"h1={s['method_h1']} h24={s['method_h24']} "
+        f"reserve={s['method_reserve']} fallback={s['method_fallback']} | "
+        f"dex==gecko {s['dex_gecko_match']}/"
+        f"{s['dex_gecko_match'] + s['dex_gecko_mismatch']}"
+    )
 
 
 async def scan_robinhood(session: aiohttp.ClientSession):
@@ -339,14 +415,11 @@ async def scan_robinhood(session: aiohttp.ClientSession):
         *[(p, "update") for p in (recent or [])],
     ]
 
-    # One-time diagnostic: log all distinct chainIds so we can verify
-    # the exact Robinhood chainId string used by the API
     if not _logged_chain_ids and all_profiles_raw:
         chain_ids = sorted({p.get("chainId", "?") for p, _ in all_profiles_raw})
         print(f"[robinhood] chainIds seen in API: {', '.join(chain_ids)}")
         _logged_chain_ids = True
 
-    # Filter to Robinhood chain + dedup within batch
     profiles: list[tuple[dict, str]] = []
     seen_batch: set[str] = set()
 
@@ -373,6 +446,11 @@ async def scan_robinhood(session: aiohttp.ClientSession):
             session,
             f"{DEXSCREENER_BASE}/token-pairs/v1/{ROBINHOOD_CHAIN_ID}/{addr}"
         )
+        # priced_at: the moment the price we will store was actually observed.
+        # Everything after this (classification, gecko enrichment, chart render,
+        # Discord round-trip) is latency between the observed price and the
+        # alert the user can act on. Never measured before this build.
+        priced_at = time.time()
 
         if not pairs_data:
             _mark_seen(addr)
@@ -404,13 +482,13 @@ async def scan_robinhood(session: aiohttp.ClientSession):
             "socials": _social_context(pair.get("info") or {}),
         })
 
-        # GeckoTerminal enrichment — only for tokens we're actually alerting on
-        # (post-filter). The pool call (unique traders + pool_address) runs for
-        # every alert; the OHLCV/chart call is the rate-limit valve, spent only
-        # on stronger movers (see CHART_MIN_* above). Any failure yields None
-        # and simply drops that enrichment — never blocks the alert.
+        # GeckoTerminal enrichment — only for tokens we're actually alerting on.
+        # The pool call runs for every alert; the OHLCV/chart call is the
+        # rate-limit valve. Any failure yields None and drops that enrichment,
+        # never blocks the alert.
         enrichment = None
         chart_png = None
+        pool_addr = None
         gecko_net = await _get_gecko_network_id(session)
         if gecko_net:
             enrichment = await fetch_pool_only(session, gecko_net, addr)
@@ -425,29 +503,72 @@ async def scan_robinhood(session: aiohttp.ClientSession):
                         ohlcv, symbol_for_classify, "5m"
                     )
 
+        # Two independent pool selections meet here, and they can disagree:
+        # the price we store comes from the DexScreener pair chosen by
+        # max(liquidity), while pool_addr comes from GeckoTerminal's
+        # volume ranking. If they point at different pools, the pin and the
+        # entry price describe different markets and the measurement is broken
+        # in a way that LOOKS healthy. Counted, not assumed either way.
+        dex_pair_addr = (pair.get("pairAddress") or "").lower()
+        gecko_pool_addr = (pool_addr or "").lower()
+        if dex_pair_addr and gecko_pool_addr:
+            if dex_pair_addr == gecko_pool_addr:
+                _pool_stats["dex_gecko_match"] += 1
+            else:
+                _pool_stats["dex_gecko_mismatch"] += 1
+                print(f"[robinhood] pool mismatch {symbol_for_classify}: "
+                      f"dex={dex_pair_addr[:10]} gecko={gecko_pool_addr[:10]}")
+
+        meta = (enrichment or {}).get("pool_selection") or {}
+        if meta:
+            _pool_stats["alerts"] += 1
+            if meta.get("n_candidates", 0) > 1:
+                _pool_stats["multi_candidate"] += 1
+            else:
+                _pool_stats["sole_candidate"] += 1
+            _pool_stats[{
+                "volume_h1": "method_h1",
+                "volume_h24": "method_h24",
+                "reserve": "method_reserve",
+            }.get(meta.get("method"), "method_fallback")] += 1
+
+        # REQUIRE_TRADEABLE_POOL is False in this build: no alert is dropped for
+        # lacking a pin. Kept as an explicit branch so enabling it later is a
+        # one-line change backed by the counters above, not a rewrite.
+        if REQUIRE_TRADEABLE_POOL and not pool_addr:
+            print(f"[robinhood] {symbol_for_classify} skipped — no tradeable pool")
+            _mark_seen(addr)
+            continue
+
         result = await _send_robinhood_alert(
             session, pair, age_hours, source, classification, enrichment, chart_png
         )
+        alert_sent_at = time.time()
         _mark_seen(addr)
 
         if result in (200, 204):
             symbol = pair.get("baseToken", {}).get("symbol", "???")
             liq = (pair.get("liquidity") or {}).get("usd") or 0
 
-            # Record for performance tracking — MISSING before, so #robinhood
-            # never appeared in reports. Address is a 0x EVM address; the tracker
-            # infers the robinhood chain from that format when measuring prices.
             try:
                 alert_price = float(pair.get("priceUsd") or 0)
             except (ValueError, TypeError):
                 alert_price = 0.0
-            db.record_alert(
-                addr, symbol.lstrip("$"), "robinhood", alert_price, liquidity=liq,
+
+            _record_alert_compat(
+                addr, symbol.lstrip("$"), alert_price, liq,
+                pool_address=pool_addr,
+                priced_at=priced_at,
+                alert_sent_at=alert_sent_at,
             )
 
+            lag = alert_sent_at - priced_at
             chart_tag = " +chart" if chart_png else ""
-            print(f"[robinhood] ✅ ${symbol.lstrip('$')} [{source}] | age={age_hours:.1f}h | liq=${liq:,.0f}{chart_tag}")
+            print(f"[robinhood] ✅ ${symbol.lstrip('$')} [{source}] | "
+                  f"age={age_hours:.1f}h | liq=${liq:,.0f}{chart_tag} | "
+                  f"lag={lag:.1f}s | {format_pool_selection(enrichment)}")
             alerts_sent += 1
 
     _cleanup()
+    _log_pool_stats()
     print(f"[robinhood] Done. Alerts: {alerts_sent}")

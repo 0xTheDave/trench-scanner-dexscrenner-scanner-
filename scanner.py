@@ -24,8 +24,13 @@ from boost_monitor import scan_boosts
 from community_takeover_monitor import scan_takeovers
 from jupiter_monitor import scan_jupiter
 from robinhood_monitor import scan_robinhood
-from migration_monitor import run_migration_monitor
-from multichain_monitor import scan_multichain  # NEW
+from pumpportal_client import run_pumpportal_client
+from multichain_monitor import scan_multichain
+from nft_monitor import (  # NEW NFT
+    scan_nft_new_collections,
+    scan_nft_volume_spikes,
+    scan_nft_trending,
+)
 from performance_tracker import track_performance, maybe_send_performance_report
 from scoring import (
     compute_base_score,
@@ -47,7 +52,12 @@ BOOST_SCAN_INTERVAL_SECONDS = 300
 TAKEOVER_SCAN_INTERVAL_SECONDS = 300
 JUPITER_SCAN_INTERVAL_SECONDS = 300
 ROBINHOOD_SCAN_INTERVAL_SECONDS = 120
-MULTICHAIN_SCAN_INTERVAL_SECONDS = 60  # NEW: 4 chains x 2 endpoints = 8 req/cycle
+MULTICHAIN_SCAN_INTERVAL_SECONDS = 60
+# NEW NFT: shared OpenSea budget is 600 req/h with a 7s global lock in
+# opensea_client. Worst case below ≈ 150 req/h — comfortable headroom.
+NFT_NEW_SCAN_INTERVAL_SECONDS = 120
+NFT_SPIKES_SCAN_INTERVAL_SECONDS = 180
+NFT_TRENDING_SCAN_INTERVAL_SECONDS = 600
 PERF_TRACK_INTERVAL_SECONDS = 600
 # Poll often; the actual report cadence is gated inside
 # maybe_send_performance_report via a DB timestamp (restart-proof), so this is
@@ -582,7 +592,8 @@ async def main():
     print(f"Boost interval: {BOOST_SCAN_INTERVAL_SECONDS}s")
     print(f"Takeover interval: {TAKEOVER_SCAN_INTERVAL_SECONDS}s")
     print(f"Jupiter interval: {JUPITER_SCAN_INTERVAL_SECONDS}s")
-    print(f"Multichain interval: {MULTICHAIN_SCAN_INTERVAL_SECONDS}s")  # NEW
+    print(f"Multichain interval: {MULTICHAIN_SCAN_INTERVAL_SECONDS}s")
+    print(f"NFT intervals: new={NFT_NEW_SCAN_INTERVAL_SECONDS}s, spikes={NFT_SPIKES_SCAN_INTERVAL_SECONDS}s, trending={NFT_TRENDING_SCAN_INTERVAL_SECONDS}s")  # NEW NFT
     print(f"Liquidations: WebSocket (real-time)")
     print(f"Liquidation radar: whale position polling (60s)")
     print(f"Migrations: WebSocket (real-time)")
@@ -604,7 +615,11 @@ async def main():
         "DISCORD_WEBHOOK_ALPHA",
         "DISCORD_WEBHOOK_MIGRATIONS",
         "DISCORD_WEBHOOK_RADAR",
-        "DISCORD_WEBHOOK_MULTICHAIN",  # NEW
+        "DISCORD_WEBHOOK_MULTICHAIN",
+        "DISCORD_WEBHOOK_NFT_NEW",       # NEW NFT
+        "DISCORD_WEBHOOK_NFT_SPIKES",    # NEW NFT
+        "DISCORD_WEBHOOK_NFT_TRENDING",  # NEW NFT
+        "OPENSEA_API_KEY",               # NEW NFT
     ]
     missing = [v for v in required if not os.environ.get(v)]
     if missing:
@@ -623,12 +638,15 @@ async def main():
             run_periodic("boost", BOOST_SCAN_INTERVAL_SECONDS, scan_boosts, session, initial_delay=15),
             run_periodic("takeover", TAKEOVER_SCAN_INTERVAL_SECONDS, scan_takeovers, session, initial_delay=20),
             run_periodic("jupiter", JUPITER_SCAN_INTERVAL_SECONDS, scan_jupiter, session, initial_delay=25),
-            run_periodic("multichain", MULTICHAIN_SCAN_INTERVAL_SECONDS, scan_multichain, session, initial_delay=45),  # NEW
+            run_periodic("multichain", MULTICHAIN_SCAN_INTERVAL_SECONDS, scan_multichain, session, initial_delay=45),
+            run_periodic("nft-new", NFT_NEW_SCAN_INTERVAL_SECONDS, scan_nft_new_collections, session, initial_delay=50),        # NEW NFT
+            run_periodic("nft-spikes", NFT_SPIKES_SCAN_INTERVAL_SECONDS, scan_nft_volume_spikes, session, initial_delay=55),    # NEW NFT
+            run_periodic("nft-trending", NFT_TRENDING_SCAN_INTERVAL_SECONDS, scan_nft_trending, session, initial_delay=60),     # NEW NFT
             run_periodic("narratives", NARRATIVE_INTERVAL_SECONDS, scan_narratives, session, initial_delay=40),
             run_periodic("perf-track", PERF_TRACK_INTERVAL_SECONDS, track_performance, session, initial_delay=90),
             run_periodic("perf-report", PERF_REPORT_POLL_SECONDS, maybe_send_performance_report, session, initial_delay=120),
             run_liquidation_monitor(session),
-            run_migration_monitor(session),
+            run_pumpportal_client(session),
             run_whale_radar_monitor(session),
         )
 

@@ -1,23 +1,31 @@
-# migration_monitor.py
-# Real-time pump.fun -> DEX migration monitor via PumpPortal WebSocket.
-# Migration = token graduated from the bonding curve and just received
-# real DEX liquidity. This is the earliest actionable on-chain signal
-# the scanner has — alerts fire within ~1 minute of graduation.
-# Self-contained module (own webhook + embed), same pattern as robinhood_monitor.
+# pumpportal_client.py
+# Single shared PumpPortal WebSocket connection, multiplexing TWO subscriptions
+# on ONE connection (PumpPortal warns against multiple simultaneous connections
+# from one client — timeout risk). Replaces the old migration_monitor.py.
 #
-# Bundle enrichment runs OFF the critical path: the alert is posted the
-# moment we have a DexScreener pair, then a separate isolated task fetches
-# the (slow, unofficial) bundle report AND the OHLCV chart, then EDITS the
-# embed in place (one multipart PATCH). This keeps alerts fast while still
-# surfacing bundle risk + chart when the data arrives.
+#   subscribeMigration  -> _handle_migration  (migration alerts, unchanged
+#                          except one line that closes the launch-outcome loop)
+#   subscribeNewToken   -> _handle_create     (Launch Radar — SILENT phase:
+#                          writes to `launches`/`creator_stats`, NO Discord)
 #
-# Note: freshly-migrated tokens are minutes old, so OHLCV usually has too few
-# candles to draw — migration will most often show no chart, by design.
+# Launch Radar is in its silent data-collection phase: every new pump.fun
+# launch is recorded to the DB along with the free anti-rug signals derivable
+# from the create event (dev buy, mayhem flag, socials from the metadata uri,
+# junk-name flag). Outcome is filled in for free when/if the token later
+# appears on the migration stream. NOTHING is posted to Discord yet — we
+# collect ~N launches, then run analysis to decide whether any filter has
+# predictive value before ever building a channel.
+#
+# Cost note: subscribeNewToken and subscribeMigration are BOTH free. The only
+# extra I/O added here is a plain HTTP GET of each launch's metadata `uri`
+# (free; usually IPFS/Arweave), rate-limited by a global lock so peaks can't
+# flood the gateways. subscribeTokenTrade/AccountTrade (metered) are NOT used.
 
 import asyncio
 import aiohttp
 import json
 import os
+import re
 import time
 from datetime import datetime, timezone
 
@@ -31,22 +39,15 @@ DEXSCREENER_BASE = "https://api.dexscreener.com"
 WEBHOOK_MIGRATIONS = os.environ.get("DISCORD_WEBHOOK_MIGRATIONS", "")
 
 CHAIN_ID = "solana"
-# GeckoTerminal network id for Solana is the stable string "solana" — no
-# resolve needed (unlike robinhood).
 GECKO_NETWORK = "solana"
 
-# Light filters only — a token minutes after migration has no meaningful
-# txn/volume history yet, so the standard gem filters would reject everything.
 MIN_LIQUIDITY_USD = 10_000
 
-# DexScreener needs time to index the new pool after migration
 PAIR_FETCH_ATTEMPTS = 4
 PAIR_FETCH_DELAY_SECONDS = 15
 
-# Limit concurrent migration handlers (each waits for DexScreener indexing)
 MAX_CONCURRENT_HANDLERS = 5
 
-# Embed colors
 COLOR_DEFAULT = 0x00D4FF
 COLOR_BUNDLE_RISK = 0xFF3300
 
@@ -55,6 +56,169 @@ alerted_migrations: dict[str, float] = {}
 
 _handler_semaphore = asyncio.Semaphore(MAX_CONCURRENT_HANDLERS)
 
+# ----------------------------- Launch Radar ----------------------------- #
+
+# Global rate limit for metadata (uri) fetches — same pattern as the Gecko /
+# OpenSea clients. At ~17 launches/min average a 0.5s floor gives ~120 req/min
+# headroom for peaks without hammering IPFS/Arweave gateways.
+_METADATA_MIN_INTERVAL = 0.5
+_metadata_lock = asyncio.Lock()
+_metadata_last_call = 0.0
+_METADATA_TIMEOUT = 8
+
+# Progress heartbeat: log total collected every N launches.
+_LAUNCH_LOG_EVERY = 25
+_launch_seen_count = 0
+
+# Junk-name detection. In the SILENT phase this is only a FLAG stored on the
+# row (name_is_junk) — never a filter. We record every launch regardless, so
+# analysis can later test whether junk names actually correlate with worse
+# outcomes. Patterns cover: test/placeholder names, empty/1-2 char symbols,
+# and obvious low-effort spam. Impersonation of known names is intentionally
+# NOT hardcoded here (too noisy / subjective) — left for the analysis phase.
+_JUNK_PATTERNS = [
+    r"^\s*$",              # empty / whitespace only
+    r"^test\d*$",          # test, test1, test2...
+    r"^\?+$",              # ? / ?? / ???
+    r"^[\W_]+$",           # only symbols/underscores, no alphanumerics
+    r"^(asdf|qwer|zxcv)",  # keyboard-mash prefixes
+]
+_JUNK_RE = re.compile("|".join(_JUNK_PATTERNS), re.IGNORECASE)
+
+# Where socials commonly live inside the metadata JSON. We check flat keys
+# first, then a few known nested containers.
+_SOCIAL_KEYS = ("twitter", "telegram", "website", "discord")
+_SOCIAL_NESTS = ("extensions", "properties", "links")
+
+
+def _is_junk_name(name: str | None, symbol: str | None) -> bool:
+    """True if either the name or the ticker looks like junk/placeholder.
+    A short symbol alone (1-2 chars) is weak signal, so we only flag it when
+    it's also non-alphanumeric; real 1-2 char tickers do exist."""
+    for value in (name, symbol):
+        if value is None:
+            continue
+        if _JUNK_RE.search(value.strip()):
+            return True
+    return False
+
+
+def _extract_socials(meta: dict) -> dict:
+    """Pull social/link fields out of a token's metadata JSON, handling both
+    flat and nested shapes seen in the live diagnostic."""
+    found: dict[str, str] = {}
+    if not isinstance(meta, dict):
+        return found
+
+    for key in _SOCIAL_KEYS:
+        val = meta.get(key)
+        if val:
+            found[key] = val
+
+    for nest in _SOCIAL_NESTS:
+        container = meta.get(nest)
+        if isinstance(container, dict):
+            for key, val in container.items():
+                if val and key.lower() in _SOCIAL_KEYS:
+                    found.setdefault(key.lower(), val)
+
+    return found
+
+
+async def _fetch_metadata(session: aiohttp.ClientSession, uri: str) -> dict | None:
+    """
+    Free HTTP GET of the off-chain metadata JSON (IPFS/Arweave gateway),
+    serialized behind a global rate-limit lock. Returns parsed dict or None
+    on any failure/timeout — a failed fetch just means has_socials=0, never
+    a dropped launch.
+    """
+    global _metadata_last_call
+    if not uri:
+        return None
+
+    async with _metadata_lock:
+        delta = time.monotonic() - _metadata_last_call
+        if delta < _METADATA_MIN_INTERVAL:
+            await asyncio.sleep(_METADATA_MIN_INTERVAL - delta)
+        _metadata_last_call = time.monotonic()
+
+    try:
+        async with session.get(
+            uri, timeout=aiohttp.ClientTimeout(total=_METADATA_TIMEOUT)
+        ) as resp:
+            if resp.status != 200:
+                return None
+            # Gateways often mislabel JSON content-type -> parse permissively.
+            try:
+                return await resp.json(content_type=None)
+            except Exception:
+                text = await resp.text()
+                return json.loads(text)
+    except Exception:
+        return None
+
+
+async def _handle_create(session: aiohttp.ClientSession, event: dict):
+    """
+    Launch Radar silent phase: record a new pump.fun launch to the DB with the
+    free signals we can derive from the create event, plus socials fetched
+    from the metadata uri. No Discord, no alerts.
+    """
+    global _launch_seen_count
+
+    mint = event.get("mint")
+    if not mint:
+        return
+
+    name = event.get("name")
+    symbol = event.get("symbol")
+
+    # Socials live in the metadata JSON (confirmed by diagnostic — never inline
+    # on the event). Free GET, rate-limited; failure -> has_socials=0.
+    meta = await _fetch_metadata(session, event.get("uri"))
+    socials = _extract_socials(meta) if meta else {}
+    has_socials = bool(socials)
+    socials_json = json.dumps(socials) if socials else None
+
+    name_is_junk = _is_junk_name(name, symbol)
+
+    is_new = db.record_launch(
+        mint=mint,
+        creator_wallet=event.get("traderPublicKey"),
+        name=name,
+        symbol=symbol,
+        uri=event.get("uri"),
+        dev_buy_sol=event.get("solAmount"),
+        dev_buy_tokens=event.get("initialBuy"),
+        mcap_sol_at_launch=event.get("marketCapSol"),
+        v_sol_at_launch=event.get("vSolInBondingCurve"),
+        v_tok_at_launch=event.get("vTokensInBondingCurve"),
+        pool=event.get("pool"),
+        is_mayhem_mode=event.get("is_mayhem_mode"),
+        has_socials=has_socials,
+        socials_json=socials_json,
+        name_is_junk=name_is_junk,
+        signature=event.get("signature"),
+    )
+
+    if not is_new:
+        return  # duplicate create event — already counted
+
+    _launch_seen_count += 1
+    if _launch_seen_count % _LAUNCH_LOG_EVERY == 0:
+        total = db.launch_count()
+        print(
+            f"[launch] +{_launch_seen_count} this session | {total} total collected | "
+            f"latest=${str(symbol or '?').lstrip('$')} "
+            f"pool={event.get('pool')!r} mayhem={event.get('is_mayhem_mode')} "
+            f"dev_buy={event.get('solAmount')} socials={'y' if has_socials else 'n'} "
+            f"junk={'y' if name_is_junk else 'n'}"
+        )
+
+
+# ---------------------------- Migration path ---------------------------- #
+# Unchanged from migration_monitor.py, except one added line in
+# _handle_migration that closes the Launch Radar outcome loop for free.
 
 def _is_deduped(mint: str) -> bool:
     last = alerted_migrations.get(mint)
@@ -211,7 +375,6 @@ async def _send_migration_alert(
 
     embed = _build_migration_embed(mint, pair, event, bundle_label, False)
 
-    # ?wait=true makes Discord respond 200 + JSON (incl. message id) instead of 204
     send_url = f"{WEBHOOK_MIGRATIONS}?wait=true"
     try:
         async with session.post(send_url, json={"embeds": [embed]}) as resp:
@@ -289,9 +452,6 @@ async def _enrich_with_bundle(
         symbol = (pair or {}).get("baseToken", {}).get("symbol") or mint[:8]
         symbol = str(symbol).lstrip("$")
 
-        # Best-effort chart: use the DexScreener pool address directly as the
-        # GeckoTerminal pool id (same on-chain address). No data / too few
-        # candles -> None -> embed edits without an image.
         chart_png = None
         pair_address = (pair or {}).get("pairAddress")
         if pair_address:
@@ -321,9 +481,16 @@ async def _handle_migration(session: aiohttp.ClientSession, event: dict):
 
     _mark_alerted(mint)  # mark early — prevents duplicate handlers for same mint
 
+    # Launch Radar outcome loop (free): if we recorded this token's launch on
+    # the newToken stream, mark it graduated. Idempotent + no-op for tokens
+    # that launched before collection started. Never affects the alert below.
+    try:
+        if db.mark_launch_migrated(mint):
+            print(f"[launch] outcome: {mint[:8]}... graduated (marked migrated)")
+    except Exception as e:
+        print(f"[launch] mark_migrated failed for {mint[:8]}...: {e}")
+
     async with _handler_semaphore:
-        # Only the pair is on the critical path — the alert cannot go out
-        # without it (nothing to price/track). Bundle+chart are fetched after.
         pair = await _fetch_best_pair(session, mint)
 
         if pair:
@@ -342,7 +509,6 @@ async def _handle_migration(session: aiohttp.ClientSession, event: dict):
             symbol = (pair or {}).get("baseToken", {}).get("symbol") or mint[:8]
             print(f"[migration] ✅ ${str(symbol).lstrip('$')} migrated | mint={mint[:8]}...")
 
-            # Record for performance tracking (only when we have a price)
             if pair:
                 try:
                     alert_price = float(pair.get("priceUsd") or 0)
@@ -357,8 +523,6 @@ async def _handle_migration(session: aiohttp.ClientSession, event: dict):
                     liquidity=liq,
                 )
 
-            # Enrich with bundle + chart only if we can edit (have message_id)
-            # and the mint is a pump.fun token (others have no bundle data).
             if message_id and is_pumpfun_mint(mint):
                 asyncio.create_task(
                     _enrich_with_bundle(session, mint, pair, event, message_id)
@@ -367,26 +531,37 @@ async def _handle_migration(session: aiohttp.ClientSession, event: dict):
     _cleanup_dedup()
 
 
-async def run_migration_monitor(session: aiohttp.ClientSession):
+# ----------------------- Shared connection loop ------------------------- #
+
+async def run_pumpportal_client(session: aiohttp.ClientSession):
     """
-    Main WebSocket loop. Subscribes to pump.fun migration events.
-    Reconnects automatically on disconnect.
+    Main WebSocket loop. ONE connection carrying BOTH subscriptions:
+      - subscribeMigration : bonding-curve graduations (alerts)
+      - subscribeNewToken  : new launches (Launch Radar, silent collection)
+    Reconnects automatically on disconnect, re-sending both subscriptions.
+
+    Replaces run_migration_monitor(). If DISCORD_WEBHOOK_MIGRATIONS is missing
+    we still run the create path so Launch Radar collection isn't blocked by a
+    migrations misconfig.
     """
     if not WEBHOOK_MIGRATIONS:
-        print("[migration] DISCORD_WEBHOOK_MIGRATIONS not set — monitor disabled")
-        return
+        print("[pumpportal] DISCORD_WEBHOOK_MIGRATIONS not set — migration alerts disabled "
+              "(create/launch collection still active)")
 
     while True:
         try:
-            print("[migration] Connecting to PumpPortal WebSocket...")
+            print("[pumpportal] Connecting to PumpPortal WebSocket...")
             async with session.ws_connect(
                 PUMPPORTAL_WS,
                 heartbeat=30,
             ) as ws:
-                print("[migration] Connected")
+                print("[pumpportal] Connected")
 
+                # Both subscriptions on the SAME connection — never open a
+                # second WS to PumpPortal (they time out multi-connection clients).
                 await ws.send_str(json.dumps({"method": "subscribeMigration"}))
-                print("[migration] Subscribed to migration events")
+                await ws.send_str(json.dumps({"method": "subscribeNewToken"}))
+                print("[pumpportal] Subscribed to migration + newToken events")
 
                 async for msg in ws:
                     if msg.type == aiohttp.WSMsgType.TEXT:
@@ -395,26 +570,26 @@ async def run_migration_monitor(session: aiohttp.ClientSession):
                         except json.JSONDecodeError:
                             continue
 
-                        # Skip subscription confirmations / service messages
                         if not isinstance(data, dict) or "mint" not in data:
                             continue
 
-                        # Fire-and-forget so the WS loop never blocks on
-                        # DexScreener indexing waits
-                        asyncio.create_task(_handle_migration(session, data))
+                        if data.get("txType") == "create":
+                            asyncio.create_task(_handle_create(session, data))
+                        else:
+                            asyncio.create_task(_handle_migration(session, data))
 
                     elif msg.type in (
                         aiohttp.WSMsgType.ERROR,
                         aiohttp.WSMsgType.CLOSED,
                     ):
-                        print(f"[migration] WebSocket closed/error")
+                        print("[pumpportal] WebSocket closed/error")
                         break
 
         except asyncio.CancelledError:
-            print("[migration] Monitor cancelled")
+            print("[pumpportal] Client cancelled")
             return
         except Exception as e:
-            print(f"[migration] Connection error: {e}")
+            print(f"[pumpportal] Connection error: {e}")
 
-        print("[migration] Reconnecting in 5s...")
+        print("[pumpportal] Reconnecting in 5s...")
         await asyncio.sleep(5)

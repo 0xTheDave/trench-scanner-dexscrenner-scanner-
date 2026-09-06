@@ -8,24 +8,29 @@
 # where capital is showing up before the crowd notices.
 #
 # Self-contained (own webhook + embed), same pattern as robinhood_monitor /
-# migration_monitor — discord_client.py is untouched.
+# pumpportal_client — discord_client.py is untouched.
 #
-# Data source: GeckoTerminal trending_pools + new_pools (free, 30/min shared).
-# Both endpoints already carry reserve + unique buyers/sellers, so ONE call per
-# (chain, endpoint) gives full data — no per-token enrichment call needed.
+# Data source: GeckoTerminal trending_pools + new_pools (free, 30/min shared,
+# gated at 9/min by geckoterminal_client). Both endpoints already carry reserve
+# + unique buyers/sellers, so ONE call per (chain, endpoint) gives full data —
+# no per-token enrichment call needed.
 #
 # --- Two structural properties worth stating up front ---
 # 1. CHAIN ROTATION: scan_multichain scans ONE chain per call, advancing a
-#    module-level cursor. Called every 60s from scanner.py, the 4-chain cycle
-#    completes every 240s — same per-chain freshness as before, but only 2 gecko
-#    calls (trending + new) hit the shared 30/min budget per 60s window instead
-#    of 8 in a single burst. That burst was the main remaining 429-storm source
-#    once jupiter enrichment was gated.
+#    module-level cursor. Called every 60s from scanner.py, the 6-chain cycle
+#    completes every 360s. Adding INK + HyperEVM stretched the cycle from 240s
+#    to 360s but did NOT change gecko load: it is still 2 calls per 60s window
+#    against the shared budget, because only one chain is scanned per call.
+#    Per-chain freshness drops from 4 to 6 minutes — acceptable for a "waking
+#    up" signal, and the only alternative (calling scan_multichain more often)
+#    would mean touching scanner.py and raising gecko pressure.
 # 2. PER-CHAIN WEBHOOK + FILTERS: Base is a large, liquid chain that fires far
 #    more than the quiet chains, so it gets its OWN channel (DISCORD_WEBHOOK_BASE)
 #    and its OWN, stricter floors — otherwise its volume drowns the quiet-chain
-#    signals and the shared floor is too loose for it. Any chain without an
-#    override uses the default webhook + default floors.
+#    signals and the shared floor is too loose for it. INK and HyperEVM also get
+#    their own channels but keep the DEFAULT floors for now: we have zero live
+#    data from them, and Base's overrides were only written after observing a
+#    real distribution of alerts. Tune them the same way, on data, not on feel.
 #
 # Hard lessons baked into the filters (from live FEFER data on Stable + first
 # live run on Base/Monad/Plasma):
@@ -35,8 +40,8 @@
 #     contract -> dedup + identity are keyed on the token ADDRESS, never symbol.
 #   - The meme is sometimes the QUOTE token ("WgUSDT / FEFER") -> we pick the
 #     non-boring side of the pair as the token of interest.
-#   - Infrastructure pools (USDT0/WXPL, WBTC/MON, USDC/MON) have BOTH sides
-#     boring -> they are not signals and are skipped entirely.
+#   - Infrastructure pools (USDT0/WXPL, WBTC/MON, USDC/MON, WHYPE/USDT0) have
+#     BOTH sides boring -> they are not signals and are skipped entirely.
 
 import asyncio
 import aiohttp
@@ -47,7 +52,8 @@ from datetime import datetime, timezone
 import db
 from geckoterminal_client import fetch_trending_pools, fetch_new_pools
 
-# Default webhook for chains without their own. Base routes to its own channel.
+# Default webhook for chains without their own. Base/INK/HyperEVM route to
+# their own channels.
 WEBHOOK_MULTICHAIN = os.environ.get("DISCORD_WEBHOOK_MULTICHAIN", "")
 
 # Default activity + liquidity floors. Loose (fresh, quiet chains), tuned on
@@ -74,21 +80,36 @@ BASE_FILTER_OVERRIDES = {
 }
 
 # Chains to watch. Key = GeckoTerminal network id (verified live against
-# /networks). All four are EVM (0x addresses). Sui ('sui-network') is Move and
-# is deliberately left out of v1 — its address format differs and needs its own
-# checkpoint. 'label' is display-only; 'dexscreener' is the chainId used to
-# build a DexScreener link (matches GeckoTerminal id for these chains).
+# /networks and, for hyperevm, against a live GeckoTerminal pool URL). All six
+# are EVM (0x addresses). Sui ('sui-network') is Move and is deliberately left
+# out — its address format differs and needs its own checkpoint.
+# 'label' is display-only; 'dexscreener' is the chainId used to build a
+# DexScreener link (matches the GeckoTerminal id for these chains).
 # 'webhook_env' + 'filter_overrides' are optional per-chain routing/tuning.
+#
+# INK: Kraken's OP-stack L2, gas token is ETH, native token is INK (~$9.2M/24h).
+# HyperEVM: Hyperliquid's EVM layer, native token HYPE/WHYPE, ~30 DEXes and
+# ~$24.8M/24h. Both start on DEFAULT floors — no live sample to tune against.
 CHAINS: dict[str, dict] = {
-    "stable":  {"label": "Stable",  "dexscreener": "stable"},
-    "plasma":  {"label": "Plasma",  "dexscreener": "plasma"},
-    "base":    {
+    "stable":   {"label": "Stable",   "dexscreener": "stable"},
+    "plasma":   {"label": "Plasma",   "dexscreener": "plasma"},
+    "base":     {
         "label": "Base",
         "dexscreener": "base",
         "webhook_env": "DISCORD_WEBHOOK_BASE",
         "filter_overrides": BASE_FILTER_OVERRIDES,
     },
-    "monad":   {"label": "Monad",   "dexscreener": "monad"},
+    "monad":    {"label": "Monad",    "dexscreener": "monad"},
+    "ink":      {
+        "label": "INK",
+        "dexscreener": "ink",
+        "webhook_env": "DISCORD_WEBHOOK_INK",
+    },
+    "hyperevm": {
+        "label": "HyperEVM",
+        "dexscreener": "hyperevm",
+        "webhook_env": "DISCORD_WEBHOOK_HYPEREVM",
+    },
 }
 
 # Stable rotation order + a module-level cursor so each call scans one chain.
@@ -98,12 +119,28 @@ _chain_index = 0
 # Symbols that are NEVER the "interesting" token — stablecoins, wrapped/native
 # gas tokens, and liquid-staked natives. When one side of a pair is boring, the
 # other side is the token of interest; when BOTH are boring, it's an infra pool
-# and gets skipped. Compared upper-cased. Extend as new chains bring new quotes.
+# and gets skipped. Compared after _norm_symbol(). Extend as new chains bring
+# new quotes.
+#
+# The HyperEVM block below is not optional garnish: HYPE/WHYPE is the native
+# currency and feUSD, USDXL, USDe, USDT0 and USDhl are the chain's own stables,
+# while kHYPE/stHYPE/LHYPE are liquid-staked HYPE and UBTC/UETH are bridged
+# majors. Without them, WHYPE/USDT0 — one of the deepest and busiest pools on
+# the chain — would read as "boring quote + interesting WHYPE" and alert on the
+# first cycle, repeatedly, for every DEX that lists it.
 BORING_QUOTES = {
+    # Cross-chain majors and stables
     "USDT", "USDT0", "GUSDT", "WGUSDT", "USDC", "USDC.E", "DAI",
     "WETH", "ETH", "WBTC", "BTC", "SOL", "WSOL",
-    "WXPL", "XPL", "WMON", "MON", "APRMON", "STABLE", "USD1",
     "CBBTC", "WSTETH", "WEETH",
+    # Plasma / Monad / Stable natives
+    "WXPL", "XPL", "WMON", "MON", "APRMON", "STABLE", "USD1",
+    # INK — gas is ETH (covered above); INK is the chain's native token
+    "INK", "WINK", "KBTC",
+    # HyperEVM — native + LSTs + native stables + bridged majors
+    "HYPE", "WHYPE", "KHYPE", "STHYPE", "LHYPE", "WSTHYPE", "HWHYPE",
+    "FEUSD", "USDXL", "USDHL", "USDE", "SUSDE", "USDH",
+    "UBTC", "UETH", "USOL",
 }
 
 # In-memory dedup keyed on "network:token_address". Restart-persisted via kv so
@@ -111,6 +148,20 @@ BORING_QUOTES = {
 _KV_SEEN_KEY = "multichain_seen"
 _seen: dict[str, float] = {}
 _seen_loaded = False
+
+
+def _norm_symbol(symbol: str | None) -> str:
+    """
+    Upper-case a token symbol and fold look-alike unicode used by some venues.
+    GeckoTerminal renders Tether-family tickers with U+20AE (₮) instead of the
+    letter T — "USD₮0" rather than "USDT0". Plain .upper() leaves that intact,
+    so the symbol would silently miss BORING_QUOTES and every USDT0 infra pool
+    would be treated as a signal. Folding costs nothing and is correct whether
+    or not the API happens to use the unicode form.
+    """
+    if not symbol:
+        return ""
+    return symbol.strip().upper().replace("₮", "T")
 
 
 def _filters_for(network: str) -> dict:
@@ -124,9 +175,10 @@ def _filters_for(network: str) -> dict:
 def _webhook_for(network: str) -> str:
     """
     Resolve the Discord webhook for a chain. A chain with its own 'webhook_env'
-    (Base) uses that; if that env var is unset we fall back to the default
-    webhook rather than dropping the chain, so a missing DISCORD_WEBHOOK_BASE
-    degrades to the shared channel instead of losing Base signals silently.
+    (Base, INK, HyperEVM) uses that; if that env var is unset we fall back to
+    the default webhook rather than dropping the chain, so a missing
+    DISCORD_WEBHOOK_INK degrades to the shared channel instead of losing INK
+    signals silently.
     """
     env = CHAINS.get(network, {}).get("webhook_env")
     if env:
@@ -170,13 +222,14 @@ def _select_interesting(pool: dict) -> tuple[str | None, str | None]:
     """
     Decide which side of the pair is the token of interest (the meme), returning
     (address, symbol). The meme is the NON-boring side. If BOTH sides are boring
-    (stablecoin/native infra pool — USDT0/WXPL, WBTC/MON, etc.) there is nothing
-    interesting to alert on -> return (None, None) so the caller skips it.
+    (stablecoin/native infra pool — USDT0/WXPL, WBTC/MON, WHYPE/USDT0, etc.)
+    there is nothing interesting to alert on -> return (None, None) so the
+    caller skips it.
     """
     base_addr = pool.get("base_address")
-    base_sym = (pool.get("base_symbol") or "").upper()
+    base_sym = _norm_symbol(pool.get("base_symbol"))
     quote_addr = pool.get("quote_address")
-    quote_sym = (pool.get("quote_symbol") or "").upper()
+    quote_sym = _norm_symbol(pool.get("quote_symbol"))
 
     base_boring = base_sym in BORING_QUOTES
     quote_boring = quote_sym in BORING_QUOTES
@@ -385,10 +438,9 @@ async def _scan_one_chain(session: aiohttp.ClientSession, network: str) -> tuple
 async def scan_multichain(session: aiohttp.ClientSession):
     """
     Scan ONE chain per call, rotating through _CHAIN_ORDER. Called every 60s
-    from scanner.py, the full 4-chain cycle completes every 240s — same
-    per-chain freshness as the old all-at-once 240s pass, but only 2 gecko calls
-    per 60s window instead of an 8-call burst, which is what was driving the
-    remaining 429 storm.
+    from scanner.py, the full 6-chain cycle completes every 360s. Gecko load is
+    unchanged by the chain count — 2 calls per 60s window either way — because
+    only one chain is touched per invocation.
     """
     global _chain_index
 

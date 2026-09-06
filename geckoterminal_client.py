@@ -1,5 +1,5 @@
 # geckoterminal_client.py
-# GeckoTerminal Public API client (Beta, no auth, 30 req/min universal limit).
+# GeckoTerminal Public API client (Beta, no auth).
 # Used to enrich alerts with data DexScreener doesn't expose in the same form:
 #   - unique buyers/sellers (wallet-level, not raw txn counts)
 #   - token logo (image_url)
@@ -12,7 +12,34 @@
 # not assumed.
 #
 # Docs: https://apiguide.geckoterminal.com/  — RESTful JSON, versioned via
-# the Accept header. Rate limit 30/min, enforced globally here.
+# the Accept header.
+#
+# RATE LIMIT — REVISED 2026-08-28. The client was built assuming 30 req/min
+# (the limit stated in GeckoTerminal's 2024 changelog). That assumption was
+# WRONG for the current free tier: the DEX API page now advertises paid plans
+# as a 25x increase "from 10 calls/min to 250 calls/min", i.e. the free public
+# ceiling is 10/min. This explains why chronic 429s survived the first fix:
+# a 25/min sliding-window quota is 2.5x over the real limit, 3.0s spacing
+# (20/min) is 2x over it, and even the post-429 cooldown spacing of 6.0s
+# (10/min) sat exactly ON the limit with zero margin. Every layer was tuned
+# against a ceiling that doesn't exist. All three constants are now set below
+# 10/min, with the sliding window as the binding constraint.
+#
+# RATE LIMITING (two layers, both in _acquire_rate_slot):
+#   1. Spacing: minimum _MIN_REQUEST_INTERVAL between consecutive requests
+#      (widens to _COOLDOWN_INTERVAL for a window after any 429).
+#   2. Sliding-window quota: at most _WINDOW_MAX_REQUESTS in any 60s window.
+#      This is the hard ceiling; spacing alone caps steady-state throughput
+#      but says nothing about a burst clustering inside one 60s window. Four
+#      independent consumers share this limiter (jupiter enrichment, multichain
+#      discovery, migration charts, robinhood charts), so bursts overlap by
+#      default. A 429 counts toward the window too (the request was still
+#      made), so its timestamp is recorded like any other.
+#
+# BUDGET REALITY at 9/min: ~540 calls/hour total across ALL consumers. That is
+# tight enough that demand-side cuts (fewer enrich calls, slower multichain
+# rotation, chart gating) are the next lever if starvation shows up in logs —
+# see the [gecko] stats line, which reports waits and starvation directly.
 #
 # NOTE ON NUMERIC FIELDS: GeckoTerminal returns most numeric attributes
 # (reserve_in_usd, base_token_price_usd, volume_usd.*, price_change_percentage.*)
@@ -21,36 +48,62 @@
 # paths) can rely on numbers. A raw string reaching an f-string ':f' format was
 # crashing multichain mid-scan ("Unknown format code 'f' for object of type
 # 'str'") and would have silently stored string liquidity in the DB.
+#
+# POOL SELECTION — REVISED 2026-09-05. See _rank_pools for the full rationale.
+# Short version: ranking by reserve_in_usd is unsafe on Robinhood Chain, where
+# that field intermittently returns NEGATIVE values. When it does, the candidate
+# list empties and selection silently falls through to pools[0] — GeckoTerminal's
+# own ordering by CURRENT state, which for an old alert points at today's live
+# pool rather than the one that traded at alert time. Pools are now ranked by
+# trading volume instead.
 
 import asyncio
 import aiohttp
 import time
+from collections import deque
 
 API_BASE = "https://api.geckoterminal.com/api/v2"
 # Pinning the API version per GeckoTerminal's own recommendation (Beta, subject
 # to change). Update if they bump the version and responses shift.
 ACCEPT_HEADER = {"Accept": "application/json;version=20230302"}
 
-# 30 req/min universal free limit, but the docs note the effective limit
-# "varies depending on the traffic size" — so the real ceiling can dip below
-# 30. Normal spacing is 3.0s (20/min): observed 429s cluster in the first batch
-# after a restart and when jupiter + robinhood fire together, so the extra
-# margin below 30 is spent buying headroom for those bursts, not steady state.
-# After any 429 we widen to a longer cooldown window (see _trip_cooldown), since
-# every request — INCLUDING the 429 itself — counts toward the minute budget.
-_MIN_REQUEST_INTERVAL = 3.0
-_COOLDOWN_INTERVAL = 6.0        # widened spacing (~10/min) while cooling down
-_COOLDOWN_DURATION = 45.0       # how long the widened spacing lasts after a 429
+# Free-tier ceiling is 10/min (see header note). Spacing of 7.0s caps steady
+# state at ~8.5/min, leaving headroom under 10 without relying on the window.
+# After a 429 we widen to 12.0s (5/min) — genuinely below the limit, unlike the
+# previous 6.0s cooldown which sat exactly on it and so never actually recovered.
+_MIN_REQUEST_INTERVAL = 7.0
+_COOLDOWN_INTERVAL = 12.0       # widened spacing (~5/min) while cooling down
+_COOLDOWN_DURATION = 60.0       # how long the widened spacing lasts after a 429
 _rate_lock = asyncio.Lock()
 _last_request_ts = 0.0
 _cooldown_until = 0.0
 
+# Sliding-window quota (layer 2) — the hard ceiling. 9 per rolling 60s window
+# keeps one slot of margin under the 10/min free limit, absorbing clock skew
+# and the fact that the server's window boundaries don't align with ours.
+_WINDOW_SECONDS = 60.0
+_WINDOW_MAX_REQUESTS = 9
+_request_times: deque[float] = deque()
+
+# Observability. The previous fix could not be verified from logs because a
+# quota wait was silent and indistinguishable from normal operation. These
+# counters make the next verification decidable: if 429s stop but starvation
+# climbs, the limiter is working and demand must be cut; if 429s persist even
+# at 9/min, the limit is lower still (or IP-shared) and only demand cuts help.
+_STATS_INTERVAL = 300.0
+_stats_last_report = 0.0
+_stat_requests = 0
+_stat_quota_waits = 0
+_stat_quota_wait_seconds = 0.0
+_stat_429s = 0
+
 # On a 429, wait this long (unless the server sends a *sane* Retry-After) then
 # retry once. GeckoTerminal has been seen returning a near-zero Retry-After via
 # Cloudflare; honoring that literally makes the retry fire instantly into the
-# same 429 and just burns another slot — so we floor it.
-_RATE_LIMIT_BACKOFF_SECONDS = 5.0
-_MIN_RATE_LIMIT_BACKOFF = 3.0
+# same 429 and just burns another slot — so we floor it. Floor raised in line
+# with the corrected limit: a 3s retry re-entered the same exhausted window.
+_RATE_LIMIT_BACKOFF_SECONDS = 12.0
+_MIN_RATE_LIMIT_BACKOFF = 8.0
 
 # Network-id cache: GeckoTerminal uses string ids ("eth", "solana", ...), not
 # numeric chain ids. We resolve Robinhood's id once by scanning the networks
@@ -76,25 +129,93 @@ def _trip_cooldown():
     _cooldown_until = time.monotonic() + _COOLDOWN_DURATION
 
 
+def _evict_old(now: float):
+    """Drop request timestamps that have aged out of the sliding window."""
+    cutoff = now - _WINDOW_SECONDS
+    while _request_times and _request_times[0] <= cutoff:
+        _request_times.popleft()
+
+
+def _maybe_report_stats(now: float):
+    """
+    Periodic limiter health line. Called from inside the rate lock, so the
+    counters are consistent. Prints at most every _STATS_INTERVAL seconds.
+    Reading it: 'quota waits' is how often a caller was blocked by the window
+    (healthy — the limiter doing its job); 'avg wait' rising toward 60s means
+    demand exceeds the budget and consumers are starving; '429s' should be 0.
+    """
+    global _stats_last_report
+    if now - _stats_last_report < _STATS_INTERVAL:
+        return
+    _stats_last_report = now
+    avg_wait = (
+        _stat_quota_wait_seconds / _stat_quota_waits if _stat_quota_waits else 0.0
+    )
+    print(
+        f"[gecko] stats: {_stat_requests} requests | "
+        f"{_stat_quota_waits} quota waits (avg {avg_wait:.1f}s) | "
+        f"{_stat_429s} rate-limited | window {len(_request_times)}/{_WINDOW_MAX_REQUESTS}"
+    )
+
+
+def note_rate_limited():
+    """Record a 429 for the stats line. Called by _get on every 429 response."""
+    global _stat_429s
+    _stat_429s += 1
+
+
 async def _acquire_rate_slot():
     """
-    Global spacing so parallel callers can't blow the ~30/min limit.
-    Spacing widens automatically for a short cooldown window after any 429,
-    because the effective limit drops under load and a 429 means we're already
-    over — packing more requests in at the normal rate just prolongs the storm.
+    Global admission control so parallel callers can't blow the free limit.
+    Two layers, both enforced here under the same lock:
+
+      1. Spacing — at least `interval` seconds since the last request
+         (interval widens to _COOLDOWN_INTERVAL during a post-429 cooldown).
+      2. Sliding-window quota — no more than _WINDOW_MAX_REQUESTS in any
+         trailing _WINDOW_SECONDS window. If the window is full, wait exactly
+         until the oldest request ages out, then re-check.
+
+    Sleeping happens while holding the lock, on purpose: that serialises all
+    consumers behind one queue instead of letting them wake simultaneously and
+    race into the same slot. Every admitted request — success OR 429 — is
+    recorded, because a 429 still consumed a slot against the real limit.
     """
-    global _last_request_ts
+    global _last_request_ts, _stat_requests, _stat_quota_waits, _stat_quota_wait_seconds
     async with _rate_lock:
-        interval = (
-            _COOLDOWN_INTERVAL
-            if time.monotonic() < _cooldown_until
-            else _MIN_REQUEST_INTERVAL
-        )
-        now = time.monotonic()
-        wait = interval - (now - _last_request_ts)
-        if wait > 0:
-            await asyncio.sleep(wait)
-        _last_request_ts = time.monotonic()
+        while True:
+            now = time.monotonic()
+
+            # Layer 1: spacing (with cooldown widening).
+            interval = (
+                _COOLDOWN_INTERVAL
+                if now < _cooldown_until
+                else _MIN_REQUEST_INTERVAL
+            )
+            spacing_wait = interval - (now - _last_request_ts)
+
+            # Layer 2: sliding-window quota.
+            _evict_old(now)
+            if len(_request_times) >= _WINDOW_MAX_REQUESTS:
+                # Window full — must wait until the oldest request exits it.
+                quota_wait = (_request_times[0] + _WINDOW_SECONDS) - now
+            else:
+                quota_wait = 0.0
+
+            wait = max(spacing_wait, quota_wait)
+            if wait > 0:
+                if quota_wait > spacing_wait and quota_wait > 0:
+                    _stat_quota_waits += 1
+                    _stat_quota_wait_seconds += quota_wait
+                await asyncio.sleep(wait)
+                continue  # re-evaluate after sleeping (state may have shifted)
+
+            # Admitted: record this request against both layers.
+            now = time.monotonic()
+            _last_request_ts = now
+            _request_times.append(now)
+            _stat_requests += 1
+            _maybe_report_stats(now)
+            return
 
 
 async def _get(session: aiohttp.ClientSession, url: str) -> dict | None:
@@ -115,6 +236,7 @@ async def _get(session: aiohttp.ClientSession, url: str) -> dict | None:
             ) as resp:
                 if resp.status == 429:
                     _trip_cooldown()
+                    note_rate_limited()
                     if attempt == 0:
                         retry_after = resp.headers.get("Retry-After")
                         delay = _RATE_LIMIT_BACKOFF_SECONDS
@@ -171,17 +293,100 @@ async def resolve_network_id(
     return None
 
 
-def _pick_best_pool(pools: list) -> dict | None:
-    """Pick the most liquid pool from a /pools response list."""
-    valid = []
+def _pool_volume(attrs: dict, key: str) -> float:
+    """Volume for a window ('h1' or 'h24'). Missing/negative -> 0.0."""
+    v = _to_float((attrs.get("volume_usd") or {}).get(key))
+    if v is None or v < 0:
+        return 0.0
+    return v
+
+
+def _rank_pools(pools: list) -> tuple[dict | None, dict]:
+    """
+    Rank a /pools response list and return (chosen_pool, selection_metadata).
+
+    Order of preference:
+      1. volume_usd.h1  — the window that matches "traded around the alert"
+      2. volume_usd.h24 — for tokens too quiet to register an h1 figure.
+                          Observed live: h1 absent on ALL 20 pools of a token
+                          that still had h24 volume, so this is a real path,
+                          not a theoretical one.
+      3. reserve_in_usd — last resort; UNSAFE on Robinhood Chain, where this
+                          field intermittently returns negative values. Kept
+                          for other chains, where it behaves.
+      4. pools[0]       — GeckoTerminal's own ordering; recorded as
+                          'fallback_first' so its frequency is measurable
+                          instead of invisible.
+
+    WHY VOLUME. On Robinhood Chain a token typically carries one pool with real
+    turnover plus a spray of high-fee trap pools (observed on $IN: 1 pool with
+    volume, 19 without, fees up to 87%). Volume separates them cleanly (live
+    pool ~645k USD vs trap pool ~43 USD, distributions do not overlap), it is
+    available at alert time, and unlike a fee-based rule it is not tied to one
+    DEX — the fee rule was a Uniswap artifact and would have silenced 88% of
+    non-BaseToken alerts.
+
+    WHY THE METADATA. The diagnostic that motivated this change (n=38) returned
+    a 100% hit rate, but a follow-up check showed the rule was often choosing
+    the ONLY pool with any volume rather than discriminating between several.
+    A 100% score on a field of one candidate is a tautology, not evidence. The
+    metadata records n_candidates and the margin over the runner-up so this
+    resolves itself from production logs instead of costing another historical
+    reconstruction. Treat the rule as provisional until those counters say
+    otherwise.
+    """
+    meta = {
+        "method": "none",
+        "n_pools": len(pools or []),
+        "n_candidates": 0,
+        "top_volume_h1": None,
+        "runner_up_volume_h1": None,
+        "chosen_volume": None,
+    }
+    if not pools:
+        return None, meta
+
+    scored_h1, scored_h24, scored_reserve = [], [], []
     for p in pools:
         attrs = p.get("attributes") or {}
+        v1 = _pool_volume(attrs, "h1")
+        v24 = _pool_volume(attrs, "h24")
         reserve = _to_float(attrs.get("reserve_in_usd")) or 0.0
+        if v1 > 0:
+            scored_h1.append((v1, p))
+        if v24 > 0:
+            scored_h24.append((v24, p))
         if reserve > 0:
-            valid.append((reserve, p))
-    if not valid:
-        return pools[0] if pools else None
-    return max(valid, key=lambda x: x[0])[1]
+            scored_reserve.append((reserve, p))
+
+    h1_sorted = sorted(scored_h1, key=lambda x: x[0], reverse=True)
+    if h1_sorted:
+        meta["top_volume_h1"] = h1_sorted[0][0]
+        if len(h1_sorted) > 1:
+            meta["runner_up_volume_h1"] = h1_sorted[1][0]
+
+    for bucket, name in (
+        (h1_sorted, "volume_h1"),
+        (sorted(scored_h24, key=lambda x: x[0], reverse=True), "volume_h24"),
+        (sorted(scored_reserve, key=lambda x: x[0], reverse=True), "reserve"),
+    ):
+        if bucket:
+            meta["method"] = name
+            meta["n_candidates"] = len(bucket)
+            meta["chosen_volume"] = bucket[0][0]
+            return bucket[0][1], meta
+
+    meta["method"] = "fallback_first"
+    return pools[0], meta
+
+
+def _pick_best_pool(pools: list) -> dict | None:
+    """
+    Backwards-compatible wrapper: returns just the pool, discarding metadata.
+    Prefer _rank_pools in new code so the selection metadata is preserved.
+    """
+    pool, _meta = _rank_pools(pools)
+    return pool
 
 
 def _parse_pool(pool: dict) -> dict | None:
@@ -210,9 +415,11 @@ def _parse_pool(pool: dict) -> dict | None:
     return {
         "pool_address": attrs.get("address"),
         "name": attrs.get("name"),
+        "pool_created_at": attrs.get("pool_created_at"),
         "price_usd": _to_float(attrs.get("base_token_price_usd")),
         "price_change_h1": _to_float(_f(attrs, "price_change_percentage", "h1")),
         "price_change_h24": _to_float(_f(attrs, "price_change_percentage", "h24")),
+        "volume_h1": _to_float(_f(attrs, "volume_usd", "h1")),
         "volume_h24": _to_float(_f(attrs, "volume_usd", "h24")),
         "reserve_usd": _to_float(attrs.get("reserve_in_usd")),
         # The genuinely-additive bit vs DexScreener: unique wallets, not txn counts.
@@ -236,19 +443,21 @@ async def fetch_pool_only(
     Robinhood Chain, where image_url is reliably None so the logo call would
     just waste half the rate-limit budget. One HTTP call per token.
     Returns None on any failure -> caller shows 'n/a'.
-    Includes 'pool_address' so callers can fetch OHLCV for a chart.
+    Includes 'pool_address' so callers can fetch OHLCV for a chart, and
+    'pool_selection' so callers can persist/log how the pool was chosen.
     """
     pools_data = await _get(
         session, f"{API_BASE}/networks/{network}/tokens/{token_address}/pools"
     )
     if not pools_data or not pools_data.get("data"):
         return None
-    best = _pick_best_pool(pools_data["data"])
+    best, meta = _rank_pools(pools_data["data"])
     if not best:
         return None
     fields = _parse_pool(best)
     if fields is None:
         return None
+    fields["pool_selection"] = meta
     fields["logo_url"] = None  # not fetched on this path
     return fields
 
@@ -273,15 +482,17 @@ async def fetch_token_enrichment(
         attrs = (token_data.get("data") or {}).get("attributes") or {}
         logo_url = attrs.get("image_url")
 
-    # Pools for this token (pick most liquid)
+    # Pools for this token (ranked by volume)
     pools_data = await _get(
         session, f"{API_BASE}/networks/{network}/tokens/{token_address}/pools"
     )
     pool_fields = None
     if pools_data and pools_data.get("data"):
-        best = _pick_best_pool(pools_data["data"])
+        best, meta = _rank_pools(pools_data["data"])
         if best:
             pool_fields = _parse_pool(best)
+            if pool_fields is not None:
+                pool_fields["pool_selection"] = meta
 
     if pool_fields is None and logo_url is None:
         return None
@@ -298,17 +509,27 @@ async def fetch_ohlcv(
     timeframe: str = "minute",
     aggregate: int = 5,
     limit: int = 100,
+    before_timestamp: int | None = None,
 ) -> list | None:
     """
     Fetch OHLCV candles for a pool. Returns the raw ohlcv_list
     ([[ts, o, h, l, c, v], ...], newest-first) or None on failure / no data.
     Defaults to 5-minute candles, last 100. One HTTP call.
     The chart renderer decides whether there are enough candles to draw.
+
+    before_timestamp bounds the window from above — needed by
+    performance_tracker to measure a PINNED pool at a past timestamp rather
+    than reading its current state.
+
+    None means "this request returned no candles" and nothing more. It is NOT a
+    fact about the token, and log lines must not describe it as one.
     """
     url = (
         f"{API_BASE}/networks/{network}/pools/{pool_address}"
         f"/ohlcv/{timeframe}?aggregate={aggregate}&limit={limit}&currency=usd"
     )
+    if before_timestamp is not None:
+        url += f"&before_timestamp={int(before_timestamp)}"
     data = await _get(session, url)
     if not data:
         return None
@@ -325,6 +546,31 @@ def format_unique_traders(enrichment: dict | None) -> str:
     if b is None and s is None:
         return "n/a"
     return f"{b if b is not None else '?'} buyers / {s if s is not None else '?'} sellers (1h)"
+
+
+def format_pool_selection(enrichment: dict | None) -> str:
+    """
+    One-line summary of how the pool was chosen, for logs.
+    'margin=sole' means only one pool had volume — the rule did not actually
+    choose between candidates. Watch how often that appears before treating
+    volume ranking as validated.
+    """
+    meta = (enrichment or {}).get("pool_selection") or {}
+    if not meta:
+        return "pool=n/a"
+    top = meta.get("top_volume_h1")
+    runner = meta.get("runner_up_volume_h1")
+    if not runner:
+        margin = "sole"
+    elif top:
+        margin = f"{top / runner:.1f}x"
+    else:
+        margin = "?"
+    return (
+        f"pool_by={meta.get('method')} "
+        f"cand={meta.get('n_candidates')}/{meta.get('n_pools')} "
+        f"margin={margin}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -492,17 +738,17 @@ async def fetch_new_pools(
 
 # ---------------------------------------------------------------------------
 # Diagnostic: run `python geckoterminal_client.py` to see live what
-# GeckoTerminal returns for a real Robinhood-chain token, so we can compare
-# against DexScreener before deciding how deeply to integrate.
+# GeckoTerminal returns for a real Robinhood-chain token, plus the full pool
+# ranking so the selection can be eyeballed against GeckoTerminal's own page.
 # Test token: $IN (INSIDERS.BOT) from a live robinhood-gems alert.
 # ---------------------------------------------------------------------------
 async def _diagnostic():
     test_token = "0x6F572E8020247324D7B9dc15c297a32e4187dF1C"  # $IN on Robinhood Chain
 
     async with aiohttp.ClientSession() as session:
-        print("=" * 60)
+        print("=" * 64)
         print("GeckoTerminal diagnostic — Robinhood Chain coverage check")
-        print("=" * 60)
+        print("=" * 64)
 
         net_id = await resolve_network_id(session, "robinhood")
         print(f"\nResolved Robinhood network id: {net_id!r}")
@@ -511,21 +757,30 @@ async def _diagnostic():
                   "Stick with DexScreener for that chain.")
             return
 
-        print(f"\nFetching pool-only enrichment for $IN ({test_token[:10]}...) on '{net_id}'...")
-        enr = await fetch_pool_only(session, net_id, test_token)
-
-        if not enr:
-            print("-> No data returned. GeckoTerminal may not index this token yet.")
+        pools_data = await _get(
+            session, f"{API_BASE}/networks/{net_id}/tokens/{test_token}/pools")
+        if not pools_data or not pools_data.get("data"):
+            print("-> No pools returned. GeckoTerminal may not index this token yet.")
             return
 
-        print("\n--- What GeckoTerminal returned ---")
-        for k, v in enr.items():
-            print(f"  {k}: {v}")
+        print(f"\nPools returned: {len(pools_data['data'])}")
+        print(f"{'name':<28} {'vol h1':>12} {'vol h24':>12} {'reserve':>12}")
+        for p in pools_data["data"]:
+            a = p.get("attributes") or {}
+            print(f"{(a.get('name') or '?')[:28]:<28} "
+                  f"{_pool_volume(a, 'h1'):>12,.0f} "
+                  f"{_pool_volume(a, 'h24'):>12,.0f} "
+                  f"{(_to_float(a.get('reserve_in_usd')) or 0):>12,.0f}")
 
-        print("\n--- The additive fields vs DexScreener ---")
-        print(f"  Unique traders (1h): {format_unique_traders(enr)}")
+        chosen, meta = _rank_pools(pools_data["data"])
+        print(f"\nChosen: {(chosen.get('attributes') or {}).get('name')}")
+        print(f"Selection metadata: {meta}")
 
-        pool_addr = enr.get("pool_address")
+        enr = await fetch_pool_only(session, net_id, test_token)
+        print(f"\n{format_pool_selection(enr)}")
+        print(f"Unique traders: {format_unique_traders(enr)}")
+
+        pool_addr = (enr or {}).get("pool_address")
         if pool_addr:
             print(f"\nFetching OHLCV for pool {pool_addr[:10]}...")
             ohlcv = await fetch_ohlcv(session, net_id, pool_addr)
