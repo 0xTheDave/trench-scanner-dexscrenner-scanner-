@@ -96,6 +96,48 @@ def _get_conn() -> sqlite3.Connection:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            -- Launch Radar. These tables predate this block: they were created
+            -- out-of-band and already hold ~971k rows on the live DB, where
+            -- CREATE TABLE IF NOT EXISTS is a no-op. They are declared here so
+            -- a FRESH database (a Railway deploy, a rebuilt dev box) comes up
+            -- with the same schema instead of failing on first launch event.
+            -- Column list mirrors the live PRAGMA output exactly — do not
+            -- reorder or retype without migrating the existing rows.
+            CREATE TABLE IF NOT EXISTS launches (
+                mint TEXT PRIMARY KEY,
+                creator_wallet TEXT,
+                name TEXT,
+                symbol TEXT,
+                uri TEXT,
+                dev_buy_sol REAL,
+                dev_buy_tokens REAL,
+                mcap_sol_at_launch REAL,
+                v_sol_at_launch REAL,
+                v_tok_at_launch REAL,
+                pool TEXT,
+                is_mayhem_mode INTEGER,
+                has_socials INTEGER,
+                socials_json TEXT,
+                name_is_junk INTEGER,
+                created_at REAL,
+                signature TEXT,
+                migrated INTEGER DEFAULT 0,
+                migrated_at REAL,
+                velocity_60s REAL,
+                unique_buyers_60s INTEGER,
+                buyers_measured INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_launches_created ON launches(created_at);
+            CREATE INDEX IF NOT EXISTS idx_launches_creator ON launches(creator_wallet);
+
+            CREATE TABLE IF NOT EXISTS creator_stats (
+                creator_wallet TEXT PRIMARY KEY,
+                total_launches INTEGER DEFAULT 0,
+                migrated_count INTEGER DEFAULT 0,
+                first_seen REAL,
+                last_seen REAL
+            );
         """)
         _conn.commit()
         # Fresh databases get the columns from the block above; existing ones
@@ -256,6 +298,146 @@ def latency_rows(days: int = 7, channel: str | None = None) -> list[dict]:
     cursor = conn.execute(query, params)
     columns = [d[0] for d in cursor.description]
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+# === Launch Radar (silent collection phase) ===
+#
+# pumpportal_client writes here on every pump.fun/bonk create event and closes
+# the outcome loop on the migration stream. Nothing is alerted from these
+# tables — they exist so the question "does any launch-time signal predict
+# graduation?" can be answered from data rather than intuition.
+#
+# NOTE ON `pool`: the discriminator between pump.fun and bonk launches is this
+# field ('pump' or 'bonk'), NOT a "platform" key — that belongs to a different
+# provider and does not exist in the PumpPortal stream. Bonk rows lack
+# v_sol_at_launch / v_tok_at_launch / is_mayhem_mode entirely, so ANY analysis
+# touching those columns must filter WHERE pool='pump' or it will silently
+# compare populations that were never measured the same way.
+
+
+def record_launch(
+    mint: str,
+    creator_wallet: str | None = None,
+    name: str | None = None,
+    symbol: str | None = None,
+    uri: str | None = None,
+    dev_buy_sol: float | None = None,
+    dev_buy_tokens: float | None = None,
+    mcap_sol_at_launch: float | None = None,
+    v_sol_at_launch: float | None = None,
+    v_tok_at_launch: float | None = None,
+    pool: str | None = None,
+    is_mayhem_mode: bool | int | None = None,
+    has_socials: bool | int | None = None,
+    socials_json: str | None = None,
+    name_is_junk: bool | int | None = None,
+    signature: str | None = None,
+) -> bool:
+    """
+    Record a new launch. Returns True if this mint was newly inserted, False if
+    it was already present (PumpPortal repeats create events on reconnect).
+
+    Existence is checked with an explicit SELECT rather than relying on
+    INSERT OR IGNORE + rowcount. On the live database `mint` is the primary
+    key so both work, but the tables were created out-of-band and a rebuilt DB
+    that somehow lacked the constraint would silently accumulate duplicates
+    under the rowcount approach. The extra SELECT costs nothing at this write
+    rate (~17/min) and cannot be wrong.
+
+    creator_stats is updated only for genuinely new mints, so a replayed event
+    cannot inflate a wallet's launch count.
+    """
+    if not mint:
+        return False
+
+    conn = _get_conn()
+    existing = conn.execute(
+        "SELECT 1 FROM launches WHERE mint = ?", (mint,)
+    ).fetchone()
+    if existing:
+        return False
+
+    now = time.time()
+    conn.execute(
+        "INSERT INTO launches ("
+        "mint, creator_wallet, name, symbol, uri, "
+        "dev_buy_sol, dev_buy_tokens, mcap_sol_at_launch, "
+        "v_sol_at_launch, v_tok_at_launch, pool, is_mayhem_mode, "
+        "has_socials, socials_json, name_is_junk, created_at, signature, "
+        "migrated"
+        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+        (
+            mint, creator_wallet, name, symbol, uri,
+            dev_buy_sol, dev_buy_tokens, mcap_sol_at_launch,
+            v_sol_at_launch, v_tok_at_launch, pool,
+            int(bool(is_mayhem_mode)) if is_mayhem_mode is not None else None,
+            int(bool(has_socials)) if has_socials is not None else None,
+            socials_json,
+            int(bool(name_is_junk)) if name_is_junk is not None else None,
+            now, signature,
+        ),
+    )
+
+    if creator_wallet:
+        conn.execute(
+            "INSERT INTO creator_stats "
+            "(creator_wallet, total_launches, migrated_count, first_seen, last_seen) "
+            "VALUES (?, 1, 0, ?, ?) "
+            "ON CONFLICT(creator_wallet) DO UPDATE SET "
+            "total_launches = total_launches + 1, last_seen = excluded.last_seen",
+            (creator_wallet, now, now),
+        )
+
+    conn.commit()
+    return True
+
+
+def mark_launch_migrated(mint: str) -> bool:
+    """
+    Close the outcome loop: flag a recorded launch as graduated.
+
+    Returns True only when this call actually changed something — i.e. the mint
+    was in `launches` and was not already flagged. False means either the token
+    launched before collection started (the common case early on) or the event
+    was a duplicate. Both are normal and neither is an error.
+
+    Idempotent by construction: the UPDATE is guarded on migrated != 1, so a
+    repeated migration event cannot double-count the creator's success tally.
+    """
+    if not mint:
+        return False
+
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT creator_wallet, migrated FROM launches WHERE mint = ?", (mint,)
+    ).fetchone()
+    if row is None:
+        return False           # launched before collection started
+    creator_wallet, already = row[0], row[1]
+    if already == 1:
+        return False           # duplicate migration event
+
+    now = time.time()
+    conn.execute(
+        "UPDATE launches SET migrated = 1, migrated_at = ? "
+        "WHERE mint = ? AND (migrated IS NULL OR migrated != 1)",
+        (now, mint),
+    )
+    if creator_wallet:
+        conn.execute(
+            "UPDATE creator_stats SET migrated_count = migrated_count + 1, "
+            "last_seen = ? WHERE creator_wallet = ?",
+            (now, creator_wallet),
+        )
+    conn.commit()
+    return True
+
+
+def launch_count() -> int:
+    """Total launches collected so far. Used by the progress heartbeat."""
+    conn = _get_conn()
+    row = conn.execute("SELECT COUNT(*) FROM launches").fetchone()
+    return row[0] if row else 0
 
 
 # === Restart-proof seen/dedup state ===
