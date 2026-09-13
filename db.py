@@ -12,6 +12,22 @@ DB_PATH = os.environ.get("SCANNER_DB_PATH", "trench_scanner.db")
 
 _PRICE_COLUMNS = ("price_1h", "price_6h", "price_24h")
 
+# Which column records HOW each price column was measured. Measurement method
+# is tracked per slot, not per row: a row alerted before the pinned-pool path
+# ships gets its 1h reading from the old method and its 24h reading from the
+# new one. A single per-row marker would silently mislabel one of them.
+_SOURCE_COLUMNS = {
+    "price_1h": "price_1h_src",
+    "price_6h": "price_6h_src",
+    "price_24h": "price_24h_src",
+}
+
+# Method identifiers written into the _src columns. Any aggregation that mixes
+# these is comparing two different measurements, so reports must group by them
+# rather than averaging across.
+SRC_DEXSCREENER_CURRENT = "dexscreener_current"   # most-liquid pair, read at measurement time
+SRC_GECKO_PINNED = "gecko_pinned_ohlcv"           # pinned pool, OHLCV bounded at the slot
+
 # Columns added after the alerts table shipped. CREATE TABLE IF NOT EXISTS is a
 # no-op on an existing database, so declaring them in the schema block alone
 # would silently do nothing on any DB that already has rows — the writes would
@@ -24,10 +40,30 @@ _PRICE_COLUMNS = ("price_1h", "price_6h", "price_24h")
 #                   "the most liquid pool an hour later" measures a different
 #                   venue than the one that was quoted. Median divergence on the
 #                   sample was +111.6pp, with gaps past 1000pp in both directions.
+#                   Measured NULL rate: 4.0% of instrumented rows (2026-09-12),
+#                   flat across days — GeckoTerminal simply has not indexed the
+#                   freshest tokens yet. That class cannot be measured on the
+#                   pinned path and must fall back, not be dropped.
 #   pool_fee_pct    fee tier of that pool, parsed from its name. Kept for
-#                   auditing which alerts passed the <=0.05% gate.
+#                   auditing which alerts passed the <=0.05% gate. NOTE: 100%
+#                   NULL on all 884 pinned rows as of 2026-09-13 — either never
+#                   passed by the caller or the name parse always fails. Not on
+#                   the critical path (measurement keys off pool_address), but
+#                   it is a dead column that currently looks alive.
 #   priced_at       when price_at_alert was actually observed upstream.
 #   alert_sent_at   when the Discord webhook accepted the message.
+#
+#   price_*_src     how that slot was measured. See _SOURCE_COLUMNS above.
+#   entry_price_pinned
+#                   entry price re-derived from the PINNED pool's OHLCV at
+#                   alert time. Stored ALONGSIDE price_at_alert, never over it:
+#                   price_at_alert is the only record of what the alert actually
+#                   showed, and overwriting it would destroy the ability to ask
+#                   later whether the quoted price was reachable. A return
+#                   computed from entry_price_pinned and a pinned-pool exit has
+#                   both ends on the same venue; one computed from
+#                   price_at_alert does not — the two sources disagreed on
+#                   11.9% of selections (n=469, 2026-09-13).
 #
 # alert_sent_at minus priced_at is the pipeline latency: the delay between the
 # price this row records and the moment a human could first act on it. It has
@@ -38,6 +74,10 @@ _ALERT_COLUMN_ADDITIONS = (
     ("pool_fee_pct", "REAL"),
     ("priced_at", "REAL"),
     ("alert_sent_at", "REAL"),
+    ("price_1h_src", "TEXT"),
+    ("price_6h_src", "TEXT"),
+    ("price_24h_src", "TEXT"),
+    ("entry_price_pinned", "REAL"),
 )
 
 _conn: sqlite3.Connection | None = None
@@ -81,7 +121,11 @@ def _get_conn() -> sqlite3.Connection:
                 pool_address TEXT,
                 pool_fee_pct REAL,
                 priced_at REAL,
-                alert_sent_at REAL
+                alert_sent_at REAL,
+                price_1h_src TEXT,
+                price_6h_src TEXT,
+                price_24h_src TEXT,
+                entry_price_pinned REAL
             );
             CREATE INDEX IF NOT EXISTS idx_alerts_time ON alerts(alerted_at);
 
@@ -220,36 +264,81 @@ def due_measurements(column: str, delay_seconds: int, limit: int = 25) -> list[t
 
 
 def due_measurements_pinned(
-    column: str, delay_seconds: int, limit: int = 25
+    column: str,
+    delay_seconds: int,
+    limit: int = 25,
+    channel: str | None = None,
 ) -> list[dict]:
     """
     Same selection as due_measurements, returned as dicts and carrying the
-    pinned pool.
+    pinned pool plus the already-derived pinned entry price.
 
     pool_address is NULL for every row written before the pin existed and for
     every channel that does not pin one. The caller decides what that means —
     this function reports the fact and nothing more.
+
+    `channel` narrows the selection so the Gecko-backed path can claim only the
+    rows it can actually measure, instead of pulling solana rows into a
+    robinhood-only budget and returning them unmeasured.
     """
     if column not in _PRICE_COLUMNS:
         raise ValueError(f"Invalid price column: {column}")
     conn = _get_conn()
     cutoff = time.time() - delay_seconds
-    cursor = conn.execute(
-        f"SELECT id, address, channel, pool_address, pool_fee_pct, alerted_at "
+    query = (
+        f"SELECT id, address, channel, pool_address, pool_fee_pct, alerted_at, "
+        f"price_at_alert, entry_price_pinned "
         f"FROM alerts "
-        f"WHERE {column} IS NULL AND alerted_at <= ? "
-        f"ORDER BY alerted_at ASC LIMIT ?",
-        (cutoff, limit),
+        f"WHERE {column} IS NULL AND alerted_at <= ?"
     )
+    params: list = [cutoff]
+    if channel:
+        query += " AND channel = ?"
+        params.append(channel)
+    query += " ORDER BY alerted_at ASC LIMIT ?"
+    params.append(limit)
+
+    cursor = conn.execute(query, params)
     columns = [d[0] for d in cursor.description]
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 
-def set_measurement(row_id: int, column: str, price: float):
+def set_measurement(row_id: int, column: str, price: float, source: str | None = None):
+    """
+    Record a price for one slot, and how it was obtained.
+
+    `source` defaults to None so the pre-existing caller keeps working during a
+    partial deploy, but every new call should pass one: a price with no recorded
+    method cannot be separated from a differently-measured price later, and the
+    two are not comparable. Rows written before this column existed stay NULL,
+    which is itself informative — NULL means "old DexScreener path".
+    """
     if column not in _PRICE_COLUMNS:
         raise ValueError(f"Invalid price column: {column}")
     conn = _get_conn()
-    conn.execute(f"UPDATE alerts SET {column} = ? WHERE id = ?", (price, row_id))
+    if source is None:
+        conn.execute(f"UPDATE alerts SET {column} = ? WHERE id = ?", (price, row_id))
+    else:
+        src_column = _SOURCE_COLUMNS[column]
+        conn.execute(
+            f"UPDATE alerts SET {column} = ?, {src_column} = ? WHERE id = ?",
+            (price, source, row_id),
+        )
+    conn.commit()
+
+
+def set_entry_price_pinned(row_id: int, price: float):
+    """
+    Store the entry price re-derived from the pinned pool.
+
+    Written once per row and reused by every later slot, so the derivation costs
+    one API call per alert rather than one per measurement. Never touches
+    price_at_alert.
+    """
+    conn = _get_conn()
+    conn.execute(
+        "UPDATE alerts SET entry_price_pinned = ? WHERE id = ?", (price, row_id)
+    )
     conn.commit()
 
 
@@ -258,7 +347,8 @@ def performance_rows(days: int = 7) -> list[dict]:
     Return alert rows from the last N days for report aggregation.
 
     Rows are dicts, so the added keys are invisible to existing consumers that
-    index by name.
+    index by name. The _src columns are included so a report can refuse to
+    average across measurement methods.
     """
     conn = _get_conn()
     cutoff = time.time() - days * 86_400
@@ -266,12 +356,38 @@ def performance_rows(days: int = 7) -> list[dict]:
         "SELECT address, symbol, channel, score, price_at_alert, "
         "alerted_at, price_1h, price_6h, price_24h, "
         "liquidity_at_alert, pool_address, pool_fee_pct, "
-        "priced_at, alert_sent_at "
+        "priced_at, alert_sent_at, "
+        "price_1h_src, price_6h_src, price_24h_src, entry_price_pinned "
         "FROM alerts WHERE alerted_at >= ?",
         (cutoff,),
     )
     columns = [d[0] for d in cursor.description]
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def measurement_method_census(days: int = 7) -> list[tuple]:
+    """
+    Count measurements per (channel, slot, method) over the window.
+
+    Exists so the mixed-method problem stays visible: after the pinned path
+    ships, a channel's price_1h column holds readings from two incompatible
+    methods, and nothing else in the schema makes that obvious. NULL method
+    means the old DexScreener path.
+    """
+    conn = _get_conn()
+    cutoff = time.time() - days * 86_400
+    out = []
+    for column, src_column in _SOURCE_COLUMNS.items():
+        rows = conn.execute(
+            f"SELECT channel, ?, {src_column}, COUNT(*) "
+            f"FROM alerts "
+            f"WHERE alerted_at >= ? AND {column} IS NOT NULL "
+            f"GROUP BY channel, {src_column} "
+            f"ORDER BY channel",
+            (column, cutoff),
+        ).fetchall()
+        out.extend(rows)
+    return out
 
 
 def latency_rows(days: int = 7, channel: str | None = None) -> list[dict]:
