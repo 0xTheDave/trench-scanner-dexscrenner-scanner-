@@ -41,6 +41,45 @@
 # rotation, chart gating) are the next lever if starvation shows up in logs —
 # see the [gecko] stats line, which reports waits and starvation directly.
 #
+# PER-SOURCE ATTRIBUTION — ADDED 2026-09-13. The stats line reported one total
+# for every consumer combined: enough to see the budget is exhausted, useless
+# for deciding WHOSE demand to cut. Cutting a consumer that turns out to be 3%
+# of traffic and then measuring "no improvement" is a negative result produced
+# for the wrong reason. The second stats line splits the same admitted requests
+# by what the URL asked for. Zero extra HTTP; nothing at any call site changes.
+#
+# WHAT THE BUCKETS DO AND DO NOT IDENTIFY:
+#   {net}:ohlcv          — chart rendering on that network. On solana this MIXES
+#                          every consumer that draws a chart (migration alerts
+#                          and any scanner channel that renders one); the URL
+#                          cannot separate them. Do not read this bucket as
+#                          "migrations" without checking the call sites first.
+#   {net}:ohlcv:bounded  — carries before_timestamp, so it is performance_tracker
+#                          and nothing else: it is the only caller passing it.
+#   {net}:token_pools    — pool listing. robinhood = pool selection in
+#                          robinhood_monitor; solana = jupiter enrichment.
+#   {net}:token_info     — the logo call in fetch_token_enrichment.
+#   trending_pools /
+#   new_pools            — multichain discovery, AGGREGATED across all six
+#                          networks on purpose: per-chain detail would add ten
+#                          buckets to the line and no cut decision needs it yet.
+#   networks_list        — resolve_network_id, once per process per network name.
+#
+# THREE NUMBERS PER BUCKET: slots/429s/404s.
+#   - SLOTS, not logical calls. The retry after a 429 re-acquires a slot and is
+#     counted again, because it genuinely costs the shared budget twice, and the
+#     cost is what a cut decision is made against.
+#   - 404s matter on their own: a 404 spends a slot and returns nothing. The
+#     migration chart path is known to 404 on pools GeckoTerminal has not
+#     indexed, so part of that bucket is budget bought and thrown away — which
+#     is a stronger argument for cutting it than its size alone.
+# The line also prints classified=X/Y. If those disagree, _classify_source has
+# met a URL shape it does not know and the split is INCOMPLETE — not merely
+# surprising, and not to be read as a full accounting.
+#
+# Counters are cumulative from process start. A restart resets them, so a
+# measurement run must not be interrupted.
+#
 # NOTE ON NUMERIC FIELDS: GeckoTerminal returns most numeric attributes
 # (reserve_in_usd, base_token_price_usd, volume_usd.*, price_change_percentage.*)
 # as STRINGS. Both parsers below coerce them to float at the source, so every
@@ -97,6 +136,19 @@ _stat_quota_waits = 0
 _stat_quota_wait_seconds = 0.0
 _stat_429s = 0
 
+# Per-source attribution (see the header note). Keyed by _classify_source(url).
+# _stat_by_source counts admitted SLOTS; the other two count how many of those
+# came back 429 or 404. All three are cumulative from process start.
+_stat_by_source: dict[str, int] = {}
+_stat_429_by_source: dict[str, int] = {}
+_stat_404_by_source: dict[str, int] = {}
+_process_start = time.monotonic()
+# How many buckets the by-source line prints before collapsing the tail into
+# '+N more'. Keeps the line readable without hiding anything that matters: the
+# tail is only reached after the top ten, and a bucket in the tail is by
+# definition too small to be the thing worth cutting.
+_SOURCE_LINE_MAX_BUCKETS = 10
+
 # On a 429, wait this long (unless the server sends a *sane* Retry-After) then
 # retry once. GeckoTerminal has been seen returning a near-zero Retry-After via
 # Cloudflare; honoring that literally makes the retry fire instantly into the
@@ -123,6 +175,55 @@ def _to_float(v):
         return None
 
 
+def _classify_source(url: str) -> str:
+    """
+    Attribute a request to a bucket, using only the URL.
+
+    Derived rather than passed in on purpose: every call site already encodes
+    what it is doing in the path it builds, and a hand-passed label is one more
+    thing to get wrong or forget when a new caller appears. The trade-off is
+    that a bucket names an ENDPOINT ON A NETWORK, not a module — see the header
+    note for which buckets are shared. The one exact identification is
+    ':bounded', since performance_tracker is the only caller passing
+    before_timestamp.
+
+    Returns 'unrecognised' for a shape this function does not know, so an
+    unmapped URL shows up as a gap in the classified=X/Y check instead of being
+    silently folded into a neighbouring bucket and inflating it.
+    """
+    path, _, query = url.partition("?")
+    marker = "/networks"
+    idx = path.find(marker)
+    if idx < 0:
+        return "unrecognised"
+
+    parts = [p for p in path[idx + len(marker):].split("/") if p]
+    if not parts:
+        return "networks_list"
+
+    network = parts[0]
+
+    # /networks/{net}/pools/{pool}/ohlcv/{timeframe}
+    if len(parts) >= 5 and parts[1] == "pools" and parts[3] == "ohlcv":
+        if "before_timestamp=" in query:
+            return f"{network}:ohlcv:bounded"
+        return f"{network}:ohlcv"
+
+    # /networks/{net}/tokens/{addr}/pools
+    if len(parts) >= 4 and parts[1] == "tokens" and parts[3] == "pools":
+        return f"{network}:token_pools"
+
+    # /networks/{net}/tokens/{addr}
+    if len(parts) == 3 and parts[1] == "tokens":
+        return f"{network}:token_info"
+
+    # /networks/{net}/trending_pools and /new_pools — aggregated across networks.
+    if len(parts) == 2 and parts[1] in ("trending_pools", "new_pools"):
+        return parts[1]
+
+    return "unrecognised"
+
+
 def _trip_cooldown():
     """Widen request spacing for the next _COOLDOWN_DURATION seconds."""
     global _cooldown_until
@@ -136,6 +237,36 @@ def _evict_old(now: float):
         _request_times.popleft()
 
 
+def _format_source_line(now: float) -> str:
+    """
+    One line attributing consumed slots to buckets, biggest first.
+
+    Per bucket: name=slots/429s/404s. Elapsed minutes are printed so a rate per
+    hour can be computed from a single line without diffing two of them.
+    classified=X/Y is the self-check described in the header.
+    """
+    elapsed_min = (now - _process_start) / 60.0
+    ranked = sorted(_stat_by_source.items(), key=lambda kv: kv[1], reverse=True)
+    shown = ranked[:_SOURCE_LINE_MAX_BUCKETS]
+    hidden = ranked[_SOURCE_LINE_MAX_BUCKETS:]
+
+    parts = [
+        f"{name}={count}"
+        f"/{_stat_429_by_source.get(name, 0)}"
+        f"/{_stat_404_by_source.get(name, 0)}"
+        for name, count in shown
+    ]
+    if hidden:
+        parts.append(f"+{len(hidden)}more={sum(c for _n, c in hidden)}")
+
+    classified = sum(_stat_by_source.values())
+    return (
+        f"[gecko] by source ({elapsed_min:.0f}m, slots/429s/404s): "
+        f"{' '.join(parts) if parts else '(none)'} "
+        f"| classified {classified}/{_stat_requests}"
+    )
+
+
 def _maybe_report_stats(now: float):
     """
     Periodic limiter health line. Called from inside the rate lock, so the
@@ -143,6 +274,8 @@ def _maybe_report_stats(now: float):
     Reading it: 'quota waits' is how often a caller was blocked by the window
     (healthy — the limiter doing its job); 'avg wait' rising toward 60s means
     demand exceeds the budget and consumers are starving; '429s' should be 0.
+    The second line splits the same total by source, so a demand cut can be
+    aimed at whoever is actually spending the budget.
     """
     global _stats_last_report
     if now - _stats_last_report < _STATS_INTERVAL:
@@ -156,15 +289,22 @@ def _maybe_report_stats(now: float):
         f"{_stat_quota_waits} quota waits (avg {avg_wait:.1f}s) | "
         f"{_stat_429s} rate-limited | window {len(_request_times)}/{_WINDOW_MAX_REQUESTS}"
     )
+    print(_format_source_line(now))
 
 
-def note_rate_limited():
-    """Record a 429 for the stats line. Called by _get on every 429 response."""
+def note_rate_limited(source: str | None = None):
+    """
+    Record a 429 for the stats line. Called by _get on every 429 response.
+    `source` is optional so any existing caller keeps working; without it the
+    429 still lands in the total but not in the per-source split.
+    """
     global _stat_429s
     _stat_429s += 1
+    if source:
+        _stat_429_by_source[source] = _stat_429_by_source.get(source, 0) + 1
 
 
-async def _acquire_rate_slot():
+async def _acquire_rate_slot(source: str = "unattributed"):
     """
     Global admission control so parallel callers can't blow the free limit.
     Two layers, both enforced here under the same lock:
@@ -179,6 +319,10 @@ async def _acquire_rate_slot():
     consumers behind one queue instead of letting them wake simultaneously and
     race into the same slot. Every admitted request — success OR 429 — is
     recorded, because a 429 still consumed a slot against the real limit.
+
+    `source` is attributed at the moment of admission, in the same place and
+    under the same lock as _stat_requests, so the per-source counts and the
+    total cannot drift apart. Default keeps any other caller working.
     """
     global _last_request_ts, _stat_requests, _stat_quota_waits, _stat_quota_wait_seconds
     async with _rate_lock:
@@ -214,6 +358,7 @@ async def _acquire_rate_slot():
             _last_request_ts = now
             _request_times.append(now)
             _stat_requests += 1
+            _stat_by_source[source] = _stat_by_source.get(source, 0) + 1
             _maybe_report_stats(now)
             return
 
@@ -225,9 +370,13 @@ async def _get(session: aiohttp.ClientSession, url: str) -> dict | None:
     does ONE real backoff+retry — honoring Retry-After only if it's >= the
     floor, otherwise using the default. A sub-floor Retry-After is ignored on
     purpose: retrying instantly just wastes another slot and 429s again.
+
+    The source is classified once and charged on EVERY attempt, so a retried
+    call shows up as the two slots it actually cost.
     """
+    source = _classify_source(url)
     for attempt in range(2):  # initial try + one retry after backoff
-        await _acquire_rate_slot()
+        await _acquire_rate_slot(source)
         try:
             async with session.get(
                 url,
@@ -236,7 +385,7 @@ async def _get(session: aiohttp.ClientSession, url: str) -> dict | None:
             ) as resp:
                 if resp.status == 429:
                     _trip_cooldown()
-                    note_rate_limited()
+                    note_rate_limited(source)
                     if attempt == 0:
                         retry_after = resp.headers.get("Retry-After")
                         delay = _RATE_LIMIT_BACKOFF_SECONDS
@@ -251,6 +400,11 @@ async def _get(session: aiohttp.ClientSession, url: str) -> dict | None:
                     print("[gecko] 429 again after retry — giving up (n/a)")
                     return None
                 if resp.status != 200:
+                    # A slot was spent and nothing came back. Counted per source
+                    # because a bucket full of 404s is budget bought and thrown
+                    # away, which argues for cutting it independently of size.
+                    if resp.status == 404:
+                        _stat_404_by_source[source] = _stat_404_by_source.get(source, 0) + 1
                     print(f"[gecko] HTTP {resp.status} for {url}")
                     return None
                 return await resp.json()
@@ -519,7 +673,9 @@ async def fetch_ohlcv(
 
     before_timestamp bounds the window from above — needed by
     performance_tracker to measure a PINNED pool at a past timestamp rather
-    than reading its current state.
+    than reading its current state. It is also what the by-source stats line
+    uses to separate tracker traffic from chart traffic, so a future caller
+    passing it for some other reason will land in the tracker's bucket.
 
     None means "this request returned no candles" and nothing more. It is NOT a
     fact about the token, and log lines must not describe it as one.
@@ -741,9 +897,49 @@ async def fetch_new_pools(
 # GeckoTerminal returns for a real Robinhood-chain token, plus the full pool
 # ranking so the selection can be eyeballed against GeckoTerminal's own page.
 # Test token: $IN (INSIDERS.BOT) from a live robinhood-gems alert.
+#
+# The classifier self-check runs FIRST and offline. A classifier exercised only
+# by the URLs it was written against proves nothing, so it is fed URLs built by
+# the same f-strings the production paths use: if one of those f-strings changes
+# shape later, this check and the classified=X/Y counter both move.
 # ---------------------------------------------------------------------------
+def _classifier_selfcheck():
+    """Print the bucket for every URL shape this module builds. No network."""
+    token = "0xTOKEN"
+    pool = "0xPOOL"
+    samples = [
+        (f"{API_BASE}/networks?page=1", "networks_list"),
+        (f"{API_BASE}/networks/robinhood/tokens/{token}/pools",
+         "robinhood:token_pools"),
+        (f"{API_BASE}/networks/solana/tokens/{token}", "solana:token_info"),
+        (f"{API_BASE}/networks/solana/pools/{pool}/ohlcv/minute"
+         f"?aggregate=5&limit=100&currency=usd", "solana:ohlcv"),
+        (f"{API_BASE}/networks/robinhood/pools/{pool}/ohlcv/minute"
+         f"?aggregate=1&limit=3&currency=usd&before_timestamp=1757000000",
+         "robinhood:ohlcv:bounded"),
+        (f"{API_BASE}/networks/base/trending_pools"
+         f"?include=base_token,quote_token,dex", "trending_pools"),
+        (f"{API_BASE}/networks/monad/new_pools"
+         f"?include=base_token,quote_token,dex", "new_pools"),
+    ]
+    print("=" * 64)
+    print("Source classifier self-check (offline)")
+    print("=" * 64)
+    failures = 0
+    for url, expected in samples:
+        got = _classify_source(url)
+        ok = "ok " if got == expected else "FAIL"
+        if got != expected:
+            failures += 1
+        print(f"  [{ok}] {got:<26} expected {expected}")
+    print(f"  -> {len(samples) - failures}/{len(samples)} shapes classified as expected")
+    return failures == 0
+
+
 async def _diagnostic():
     test_token = "0x6F572E8020247324D7B9dc15c297a32e4187dF1C"  # $IN on Robinhood Chain
+
+    _classifier_selfcheck()
 
     async with aiohttp.ClientSession() as session:
         print("=" * 64)
@@ -785,6 +981,8 @@ async def _diagnostic():
             print(f"\nFetching OHLCV for pool {pool_addr[:10]}...")
             ohlcv = await fetch_ohlcv(session, net_id, pool_addr)
             print(f"  OHLCV candles returned: {len(ohlcv) if ohlcv else 0}")
+
+        print(f"\n{_format_source_line(time.monotonic())}")
 
 
 if __name__ == "__main__":
