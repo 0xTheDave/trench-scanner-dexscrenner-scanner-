@@ -10,13 +10,20 @@ import time
 
 DB_PATH = os.environ.get("SCANNER_DB_PATH", "trench_scanner.db")
 
-_PRICE_COLUMNS = ("price_1h", "price_6h", "price_24h")
+# price_15m added 2026-09-13. Measured over 7 days on the same rows at all three
+# existing marks, the EARLIEST mark was the best of the three on 73-79% of rows
+# (rank statistic, so no outlier can move it), while the 24h mark was best on
+# 7-13% and carried a median of -87%. 1h is not an optimum, it is the edge of
+# what we sample: robinhood alerts fire at pool ages of 0.1-1.4h, so whatever
+# happens may well happen before the first mark. This column samples below it.
+_PRICE_COLUMNS = ("price_15m", "price_1h", "price_6h", "price_24h")
 
 # Which column records HOW each price column was measured. Measurement method
 # is tracked per slot, not per row: a row alerted before the pinned-pool path
 # ships gets its 1h reading from the old method and its 24h reading from the
 # new one. A single per-row marker would silently mislabel one of them.
 _SOURCE_COLUMNS = {
+    "price_15m": "price_15m_src",
     "price_1h": "price_1h_src",
     "price_6h": "price_6h_src",
     "price_24h": "price_24h_src",
@@ -65,6 +72,15 @@ SRC_GECKO_PINNED = "gecko_pinned_ohlcv"           # pinned pool, OHLCV bounded a
 #                   price_at_alert does not — the two sources disagreed on
 #                   11.9% of selections (n=469, 2026-09-13).
 #
+#                   MEASURED 2026-09-13, n=353 rows carrying both entries: the
+#                   ratio price_at_alert / entry_price_pinned has median 1.0031
+#                   and p10-p90 of 0.81-1.38, so for most rows the two entries
+#                   are the same price and swapping them moves a MEDIAN return
+#                   by ~0.3pp. The value of this column is entirely in the tail:
+#                   2.3% of rows are wrong by an order of magnitude, and those
+#                   are what turn a legacy return into +86,836,099,869%. Judge
+#                   this column on means and percentiles, never on medians.
+#
 # alert_sent_at minus priced_at is the pipeline latency: the delay between the
 # price this row records and the moment a human could first act on it. It has
 # never been measured, and on this chain entry prices drift ~9%/min, so it
@@ -74,9 +90,11 @@ _ALERT_COLUMN_ADDITIONS = (
     ("pool_fee_pct", "REAL"),
     ("priced_at", "REAL"),
     ("alert_sent_at", "REAL"),
+    ("price_15m", "REAL"),
     ("price_1h_src", "TEXT"),
     ("price_6h_src", "TEXT"),
     ("price_24h_src", "TEXT"),
+    ("price_15m_src", "TEXT"),
     ("entry_price_pinned", "REAL"),
 )
 
@@ -115,6 +133,7 @@ def _get_conn() -> sqlite3.Connection:
                 liquidity_at_alert REAL,
                 price_at_alert REAL NOT NULL,
                 alerted_at REAL NOT NULL,
+                price_15m REAL,
                 price_1h REAL,
                 price_6h REAL,
                 price_24h REAL,
@@ -122,6 +141,7 @@ def _get_conn() -> sqlite3.Connection:
                 pool_fee_pct REAL,
                 priced_at REAL,
                 alert_sent_at REAL,
+                price_15m_src TEXT,
                 price_1h_src TEXT,
                 price_6h_src TEXT,
                 price_24h_src TEXT,
@@ -268,6 +288,7 @@ def due_measurements_pinned(
     delay_seconds: int,
     limit: int = 25,
     channel: str | None = None,
+    max_age_seconds: float | None = None,
 ) -> list[dict]:
     """
     Same selection as due_measurements, returned as dicts and carrying the
@@ -280,11 +301,32 @@ def due_measurements_pinned(
     `channel` narrows the selection so the Gecko-backed path can claim only the
     rows it can actually measure, instead of pulling solana rows into a
     robinhood-only budget and returning them unmeasured.
+
+    `max_age_seconds` bounds the selection from the OTHER side: only rows
+    alerted within this many seconds are returned. Required by any short-horizon
+    slot, for two reasons that compound:
+
+      1. GeckoTerminal does not retain minute candles indefinitely. Asking for a
+         15-minute mark on a five-day-old alert returns nothing on a quiet pool,
+         which the tracker records as nodata — a fact about candle retention
+         written into the DB as if it were a fact about the token.
+      2. Selection is ORDER BY alerted_at ASC. The moment a new price column
+         exists, EVERY historical row has it NULL and is past its delay, so the
+         oldest rows are claimed first and the budget is spent entirely on the
+         backlog. A new short-horizon column would fill up with nodata from last
+         week and never reach a fresh alert, and the slot would look broken
+         rather than starved.
+
+    Bounding here rather than skipping in the caller's loop is deliberate: a row
+    skipped inside the loop is re-selected on every later run forever, which is
+    the starvation failure the slot rotation exists to prevent. A row excluded
+    by this bound simply stops being a candidate.
     """
     if column not in _PRICE_COLUMNS:
         raise ValueError(f"Invalid price column: {column}")
     conn = _get_conn()
-    cutoff = time.time() - delay_seconds
+    now = time.time()
+    cutoff = now - delay_seconds
     query = (
         f"SELECT id, address, channel, pool_address, pool_fee_pct, alerted_at, "
         f"price_at_alert, entry_price_pinned "
@@ -292,6 +334,9 @@ def due_measurements_pinned(
         f"WHERE {column} IS NULL AND alerted_at <= ?"
     )
     params: list = [cutoff]
+    if max_age_seconds is not None:
+        query += " AND alerted_at >= ?"
+        params.append(now - max_age_seconds)
     if channel:
         query += " AND channel = ?"
         params.append(channel)
@@ -354,10 +399,11 @@ def performance_rows(days: int = 7) -> list[dict]:
     cutoff = time.time() - days * 86_400
     cursor = conn.execute(
         "SELECT address, symbol, channel, score, price_at_alert, "
-        "alerted_at, price_1h, price_6h, price_24h, "
+        "alerted_at, price_15m, price_1h, price_6h, price_24h, "
         "liquidity_at_alert, pool_address, pool_fee_pct, "
         "priced_at, alert_sent_at, "
-        "price_1h_src, price_6h_src, price_24h_src, entry_price_pinned "
+        "price_15m_src, price_1h_src, price_6h_src, price_24h_src, "
+        "entry_price_pinned "
         "FROM alerts WHERE alerted_at >= ?",
         (cutoff,),
     )
