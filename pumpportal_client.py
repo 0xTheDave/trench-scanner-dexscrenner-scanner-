@@ -20,6 +20,14 @@
 # extra I/O added here is a plain HTTP GET of each launch's metadata `uri`
 # (free; usually IPFS/Arweave), rate-limited by a global lock so peaks can't
 # flood the gateways. subscribeTokenTrade/AccountTrade (metered) are NOT used.
+#
+# PAIR SELECTION IS SHARED (2026-09-19). The pair chosen here feeds FOUR
+# things: the embed price, the MIN_LIQUIDITY_USD gate, the entry price stored
+# by record_alert, and the pool used for the chart. Taking the most liquid
+# pair without checks stored entry prices 100-1000x above the channel's normal
+# level on ~4.7% of rows and let those tokens pass the liquidity gate. The
+# rules and the evidence live in dexscreener_pairs.py, shared with
+# performance_tracker so entry and exit can never drift apart.
 
 import asyncio
 import aiohttp
@@ -30,6 +38,7 @@ import time
 from datetime import datetime, timezone
 
 import db
+import dexscreener_pairs as dsp
 from bundle_client import fetch_bundle_report, assess_bundle_risk, is_pumpfun_mint
 from geckoterminal_client import fetch_ohlcv
 from chart_renderer import render_chart_async
@@ -218,7 +227,8 @@ async def _handle_create(session: aiohttp.ClientSession, event: dict):
 
 # ---------------------------- Migration path ---------------------------- #
 # Unchanged from migration_monitor.py, except one added line in
-# _handle_migration that closes the Launch Radar outcome loop for free.
+# _handle_migration that closes the Launch Radar outcome loop for free, and
+# the pair selection now going through dexscreener_pairs.
 
 def _is_deduped(mint: str) -> bool:
     last = alerted_migrations.get(mint)
@@ -259,11 +269,19 @@ async def _fetch_json(session: aiohttp.ClientSession, url: str) -> dict | list |
 async def _fetch_best_pair(
     session: aiohttp.ClientSession,
     mint: str,
-) -> dict | None:
+) -> tuple[dict | None, str]:
     """
-    Fetch the most liquid DexScreener pair for a freshly migrated mint.
+    Fetch the pair that prices a freshly migrated mint, and say how trusted it
+    is. Returns (pair, verdict) with the verdicts of dexscreener_pairs.
+
     Retries because indexing lags the on-chain event by seconds to minutes.
+
+    Selection is NOT "most liquid pair" any more: that rule picked pairs where
+    the mint is the quote token, and pairs whose priceUsd is off by a large
+    factor while reporting inflated liquidity. Both fed the entry price, the
+    liquidity gate and the embed at once.
     """
+    verdict = dsp.NOPAIR
     for attempt in range(PAIR_FETCH_ATTEMPTS):
         await asyncio.sleep(PAIR_FETCH_DELAY_SECONDS)
 
@@ -271,13 +289,14 @@ async def _fetch_best_pair(
             session,
             f"{DEXSCREENER_BASE}/token-pairs/v1/{CHAIN_ID}/{mint}"
         )
+        if not data:
+            continue
 
-        if data:
-            valid = [p for p in data if (p.get("liquidity") or {}).get("usd")]
-            if valid:
-                return max(valid, key=lambda x: x.get("liquidity", {}).get("usd", 0))
+        pair, _price, verdict = dsp.select_base_pair(data, mint, log_prefix="[migration]")
+        if pair:
+            return pair, verdict
 
-    return None
+    return None, verdict
 
 
 def _build_migration_embed(
@@ -491,7 +510,7 @@ async def _handle_migration(session: aiohttp.ClientSession, event: dict):
         print(f"[launch] mark_migrated failed for {mint[:8]}...: {e}")
 
     async with _handler_semaphore:
-        pair = await _fetch_best_pair(session, mint)
+        pair, pair_verdict = await _fetch_best_pair(session, mint)
 
         if pair:
             liq = (pair.get("liquidity") or {}).get("usd") or 0
@@ -499,6 +518,13 @@ async def _handle_migration(session: aiohttp.ClientSession, event: dict):
                 symbol = pair.get("baseToken", {}).get("symbol", "???")
                 print(f"[migration] {symbol} skipped — liq ${liq:,.0f} < ${MIN_LIQUIDITY_USD:,}")
                 return
+            if pair_verdict == dsp.UNVERIFIED:
+                # Alert and record anyway — a fresh migration often has a single
+                # pair — but say so, because this entry price could not be
+                # cross-checked and the stored row carries no such marker.
+                symbol = pair.get("baseToken", {}).get("symbol", "???")
+                print(f"[migration] {symbol} price UNVERIFIED — single pair, "
+                      f"no trusted quote asset")
         else:
             print(f"[migration] {mint[:8]}... no DexScreener pair after "
                   f"{PAIR_FETCH_ATTEMPTS} attempts — sending bare alert")

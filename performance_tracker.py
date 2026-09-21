@@ -12,6 +12,14 @@
 #   for solana channels, where the pathology does not occur and no pool is
 #   pinned.
 #
+#   BASE-SIDE FILTER (2026-09-16). /token-pairs/v1 returns every pair the token
+#   appears in, INCLUDING pairs where it is the quote token, and priceUsd always
+#   prices the BASE token. Picking the most liquid pair without checking the
+#   side stored another asset's price (verified live: GTA6 in 2 of 7 pairs,
+#   GLDX in 14 of 30 as quote). On historical rows this shows as in-row flips
+#   of >=1000x between slots (migrations 14.5%, jupiter 3.5%) and as half of
+#   jupiter's >=10x upper tail. Rows written before this fix are not repaired.
+#
 #   PINNED (GeckoTerminal OHLCV): reads the pool that was pinned at alert time,
 #   bounded to the measurement instant with before_timestamp. BOTH ends of the
 #   return come from the same venue: the entry is re-derived from that pool's
@@ -65,6 +73,7 @@ import time
 from datetime import datetime, timezone
 
 import db
+import dexscreener_pairs as dsp
 import geckoterminal_client as gt
 
 DEXSCREENER_BASE = "https://api.dexscreener.com"
@@ -73,6 +82,26 @@ WEBHOOK_PERFORMANCE = os.environ.get("DISCORD_WEBHOOK_PERFORMANCE", "")
 # Measurement method markers written to price_*_src.
 SRC_LEGACY = db.SRC_DEXSCREENER_CURRENT
 SRC_PINNED = db.SRC_GECKO_PINNED
+# Legacy request failed: non-200 status, transport error, unexpected payload
+# shape, or an unparseable/non-positive price on the chosen pair. Stored as 0.0
+# so the row is not re-selected forever (NULL would be retried every run and
+# eventually filled with a price read hours after the mark), and EXCLUDED from
+# returns: a timeout is a missing measurement, not a dead token.
+SRC_LEGACY_ERROR = "dexscreener_error"
+# Legacy request succeeded but no pair with liquidity has the token on the
+# BASE side. Stored as 0.0 and counted as -100%, matching the previous
+# behaviour for dead tokens (probe_jupiter_zeros: zeros re-alert at 5.9-12.5%
+# vs 45-68.5% for positive rows, i.e. overwhelmingly dead). The separate
+# marker keeps that assumption checkable.
+SRC_LEGACY_NOPAIR = "dexscreener_nopair"
+# Price taken from a pair that could not be cross-checked: fewer than
+# MIN_PAIRS_FOR_MEDIAN base-side pairs exist and none is quoted in a known
+# asset. The price is stored and DOES count as an outcome, but the marker
+# keeps it separable, because the cross-pair check is what catches DexScreener
+# pairs with a broken priceUsd (verified live 2026-09-19: RAY/JUP reported
+# 9341.32 with $147M liquidity against a true 1.88 — a ~4968x multiplier that
+# also appears on PAXG, BONK, PYTH, LIT and on migrations entry prices).
+SRC_LEGACY_UNVERIFIED = "dexscreener_unverified"
 # Pinned pool answered, but its newest candle at or before the measurement
 # instant is older than the slot's tolerance: the pool stopped trading before
 # the mark. The price is real but it is not the price AT the mark. Recorded
@@ -82,6 +111,9 @@ SRC_PINNED = db.SRC_GECKO_PINNED
 SRC_PINNED_STALE = "gecko_pinned_stale"
 # Pinned pool returned no candle at all before the mark.
 SRC_PINNED_NO_DATA = "gecko_pinned_nodata"
+
+# Markers whose stored 0.0 is NOT an outcome and must never enter returns.
+_NON_OUTCOME_SOURCES = (SRC_PINNED_NO_DATA, SRC_LEGACY_ERROR)
 
 # (column, seconds after alert, timeframe, aggregate, staleness tolerance)
 #
@@ -160,37 +192,46 @@ def _rotated_slots() -> tuple:
 
 # === Legacy path (DexScreener) ===
 
-async def _fetch_current_price(session: aiohttp.ClientSession, address: str) -> float:
+async def _fetch_current_price(session: aiohttp.ClientSession, address: str) -> tuple[float, str]:
     """
-    Current price from the most liquid DexScreener pair. The chain is inferred
-    from the address format: Robinhood Chain tokens are 0x-prefixed EVM
-    addresses, Solana mints are base58 (never 0x). Without this split, robinhood
-    alerts would be queried against the solana endpoint and always read as dead.
-    Returns 0.0 when no tradable pair exists — the token is dead, which
-    correctly counts as a -100% outcome, not missing data.
+    Current price from the pair chosen by dexscreener_pairs.select_base_pair
+    (base-side only, cross-checked against the other pairs). Returns
+    (price, source_marker).
+
+    The chain is inferred from the address format: Robinhood Chain tokens are
+    0x-prefixed EVM addresses, Solana mints are base58 (never 0x). Without this
+    split, robinhood alerts would be queried against the solana endpoint and
+    always read as dead.
+
+    Outcomes, deliberately kept apart:
+      (price, SRC_LEGACY)          a base-side pair priced the token, agreeing
+                                   with the median of the other pairs
+      (price, SRC_LEGACY_UNVERIFIED) too few pairs to cross-check and no known
+                                   quote asset: stored, still an outcome
+      (0.0, SRC_LEGACY_NOPAIR)     valid response, no liquid base-side pair:
+                                   treated as a dead token (-100%)
+      (0.0, SRC_LEGACY_ERROR)      request or payload failure: NOT an outcome
+
+    The selection rules and the defects behind them live in
+    dexscreener_pairs.py, which pumpportal_client shares — the migration entry
+    price had the same defect and must stay consistent with this one.
     """
     chain = "robinhood" if address.startswith("0x") else "solana"
     url = f"{DEXSCREENER_BASE}/token-pairs/v1/{chain}/{address}"
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             if resp.status != 200:
-                return 0.0
+                return 0.0, SRC_LEGACY_ERROR
             data = await resp.json()
     except Exception:
-        return 0.0
+        return 0.0, SRC_LEGACY_ERROR
 
-    if not data:
-        return 0.0
-
-    valid = [p for p in data if (p.get("liquidity") or {}).get("usd")]
-    if not valid:
-        return 0.0
-
-    best = max(valid, key=lambda x: x.get("liquidity", {}).get("usd", 0))
-    try:
-        return float(best.get("priceUsd") or 0)
-    except (ValueError, TypeError):
-        return 0.0
+    _pair, price, verdict = dsp.select_base_pair(data, address, log_prefix="[perf]")
+    if verdict == dsp.BAD_PAYLOAD:
+        return 0.0, SRC_LEGACY_ERROR
+    if verdict == dsp.NOPAIR:
+        return 0.0, SRC_LEGACY_NOPAIR
+    return price, SRC_LEGACY_UNVERIFIED if verdict == dsp.UNVERIFIED else SRC_LEGACY
 
 
 # === Budgets ===
@@ -370,8 +411,8 @@ async def _measure_pinned_slot(
         # same rows on every run, forever.
         if not row.get("pool_address"):
             await asyncio.sleep(REQUEST_DELAY)
-            price = await _fetch_current_price(session, row["address"])
-            db.set_measurement(row["id"], column, price, SRC_LEGACY)
+            price, source = await _fetch_current_price(session, row["address"])
+            db.set_measurement(row["id"], column, price, source)
             measured += 1
             verdicts["no_pin_fallback"] = verdicts.get("no_pin_fallback", 0) + 1
             continue
@@ -389,8 +430,8 @@ async def _measure_pinned_slot(
             # row to be re-selected indefinitely; the marker keeps it out of
             # pinned aggregates.
             await asyncio.sleep(REQUEST_DELAY)
-            price = await _fetch_current_price(session, row["address"])
-            db.set_measurement(row["id"], column, price, SRC_LEGACY)
+            price, source = await _fetch_current_price(session, row["address"])
+            db.set_measurement(row["id"], column, price, source)
             measured += 1
             verdicts["no_entry_fallback"] = verdicts.get("no_entry_fallback", 0) + 1
             continue
@@ -445,13 +486,17 @@ async def track_performance(session: aiohttp.ClientSession):
         print(f"[perf] pinned path: #{PINNED_CHANNEL} "
               f"({GECKO_CALL_BUDGET_PER_RUN} gecko calls/run) | "
               f"legacy path: {', '.join(LEGACY_CHANNELS)} "
-              f"({BATCH_LIMIT_LEGACY_PER_RUN} rows/run) | slot order rotates")
+              f"({BATCH_LIMIT_LEGACY_PER_RUN} rows/run, base-side pairs only) | "
+              f"slot order rotates")
 
     started = time.monotonic()
     calls = _Budget(GECKO_CALL_BUDGET_PER_RUN)
     legacy_rows = _Budget(BATCH_LIMIT_LEGACY_PER_RUN)
     measured = 0
     all_verdicts: dict[str, int] = {}
+    # Per-run count of legacy source markers, so the log shows immediately
+    # whether errors or missing base-side pairs dominate after a deploy.
+    legacy_sources: dict[str, int] = {}
 
     # Both paths walk the slots in the same rotated order, advanced once per
     # run. Under a budget the first slot visited is the one that gets served,
@@ -490,18 +535,21 @@ async def track_performance(session: aiohttp.ClientSession):
                 if not legacy_rows.take():
                     break
                 await asyncio.sleep(REQUEST_DELAY)
-                price = await _fetch_current_price(session, row["address"])
-                db.set_measurement(row["id"], column, price, SRC_LEGACY)
+                price, source = await _fetch_current_price(session, row["address"])
+                db.set_measurement(row["id"], column, price, source)
+                legacy_sources[source] = legacy_sources.get(source, 0) + 1
                 measured += 1
 
     elapsed = time.monotonic() - started
     if measured:
         detail = " ".join(f"{k}={v}" for k, v in sorted(all_verdicts.items()))
+        legacy_detail = " ".join(f"{k}={v}" for k, v in sorted(legacy_sources.items()))
         first_slot = slots[0][0]
         print(f"[perf] Recorded {measured} measurements in {elapsed:.0f}s "
               f"| from {first_slot} "
               f"| gecko {calls.spent}/{calls.limit} "
               f"| legacy rows {legacy_rows.spent}/{legacy_rows.limit}"
+              + (f" | legacy: {legacy_detail}" if legacy_detail else "")
               + (f" | pinned: {detail}" if detail else ""))
 
 
@@ -535,14 +583,15 @@ def _slot_stats(rows: list[dict], column: str, src_column: str) -> dict[str, lis
 
     Grouping is not presentation — it is correctness. A DexScreener reading and
     a pinned-pool reading answer different questions, and their median pooled
-    together is a number that describes no population. Rows marked no_data are
-    excluded entirely: a 0.0 written because the pool was unindexed is not a
+    together is a number that describes no population. Rows whose marker is a
+    non-outcome (pinned no_data, legacy request error) are excluded entirely: a
+    0.0 written because the pool was unindexed or the request failed is not a
     -100% outcome.
     """
     groups: dict[str, list[float]] = {}
     for row in rows:
         src = row.get(src_column)
-        if src == SRC_PINNED_NO_DATA:
+        if src in _NON_OUTCOME_SOURCES:
             continue
         ret = _pct_return(_entry_for(row, src), row.get(column))
         if ret is None:
@@ -580,7 +629,7 @@ def _channel_summary(rows: list[dict]) -> str:
     rugs = sum(
         1 for x in rows
         if x.get("price_24h") is not None
-        and x.get("price_24h_src") != SRC_PINNED_NO_DATA
+        and x.get("price_24h_src") not in _NON_OUTCOME_SOURCES
         and (_entry_for(x, x.get("price_24h_src")) or 0) > 0
         and x["price_24h"] <= _entry_for(x, x.get("price_24h_src")) * RUG_THRESHOLD
     )
