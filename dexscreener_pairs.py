@@ -35,9 +35,19 @@
 # floor, the most liquid pair is returned as UNVERIFIED: that is the live pool
 # in every dust case seen, and inflated broken pairs never sit below the floor.
 #
+#   TWO VOTERS, NO MAJORITY (2026-09-21). With exactly two pairs above the
+#   floor there is no median, and the trusted-quote preference decides alone.
+#   Live: EYXnJnQS... meteora/SOL $1,193 with a price frozen at 1.617e-4 for
+#   27+ minutes beat raydium/wXRP $18k with 6,980 txns at 3.7e-5 (4.36x).
+#   Ranking by transactions fixed that case but picked a pool priced through
+#   a fresh meme quote on GLORP (18% off five agreeing SOL pools), so it was
+#   rejected. The pick is kept; when the two voters disagree by more than
+#   VOTER_DISAGREEMENT_FACTOR the verdict drops to UNVERIFIED instead, so the
+#   row can be told apart afterwards.
+#
 # Known limitation: if exactly two pairs clear the floor, one broken and one
 # honest, and both are quoted in a trusted asset, the most liquid one wins,
-# which is the broken one. Not observed live so far.
+# which is the broken one. It is now flagged UNVERIFIED rather than OK.
 #
 # This module is shared by performance_tracker (exit prices) and
 # pumpportal_client (migration entry price, liquidity gate, chart pair).
@@ -52,13 +62,16 @@ MIN_PAIRS_FOR_MEDIAN = 3
 # pool $2,082. The margin is roughly 2x on each side; revisit if either end
 # moves.
 MIN_VOTING_LIQUIDITY_USD = 1000.0
+# Calibrated on live data 2026-09-21: honest two-voter spreads 1.03x, 1.18x,
+# 1.37x; stale-pool spread 4.36x. Only changes the verdict, never the pick.
+VOTER_DISAGREEMENT_FACTOR = 2.0
 # Symbols rather than mints: the same asset appears under several wrapped
 # mints and this check only needs to be indicative.
 TRUSTED_QUOTE_SYMBOLS = ("SOL", "WSOL", "USDC", "USDT")
 
 # Verdicts returned alongside the pair.
 OK = "ok"                    # cross-checked against other pairs, or trusted quote
-UNVERIFIED = "unverified"    # too few pairs to check and no trusted quote, or no pair above the floor
+UNVERIFIED = "unverified"    # no trusted quote among too few voters, two voters disagreeing, or no pair above the floor
 NOPAIR = "nopair"            # valid payload, no base-side pair with liquidity
 BAD_PAYLOAD = "bad_payload"  # not a list of pair objects
 
@@ -101,6 +114,8 @@ def select_base_pair(payload, address: str, log_prefix: str = "") -> tuple[dict 
     is unavailable, prefer voters quoted in a trusted asset; if none
     qualifies, the most liquid voter is returned with the UNVERIFIED verdict —
     a price the caller may use but should be able to tell apart afterwards.
+    Two voters whose prices differ by more than VOTER_DISAGREEMENT_FACTOR
+    also yield UNVERIFIED, with the pick unchanged.
     """
     if not isinstance(payload, list):
         return None, None, BAD_PAYLOAD
@@ -146,6 +161,10 @@ def select_base_pair(payload, address: str, log_prefix: str = "") -> tuple[dict 
         if not candidates:
             candidates = voters
             verdict = UNVERIFIED
+        elif len(voters) > 1:
+            voter_prices = [price for _, price, _ in voters]
+            if max(voter_prices) / min(voter_prices) > VOTER_DISAGREEMENT_FACTOR:
+                verdict = UNVERIFIED
 
     best = max(candidates, key=lambda item: item[2])
     if top_liquidity[0] is not best[0] and log_prefix:
