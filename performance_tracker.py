@@ -10,7 +10,9 @@
 #   so "most liquid an hour later" routinely names a different venue than the
 #   one that was quoted — median divergence +111.6pp on the sampled rows. Kept
 #   for solana channels, where the pathology does not occur and no pool is
-#   pinned.
+#   pinned, and for the multichain EVM channels (2026-09-21), whose chain is
+#   read from the channel name "multichain_<network>" because an 0x address
+#   alone cannot tell Base from Robinhood Chain.
 #
 #   BASE-SIDE FILTER (2026-09-16). /token-pairs/v1 returns every pair the token
 #   appears in, INCLUDING pairs where it is the quote token, and priceUsd always
@@ -75,6 +77,7 @@ from datetime import datetime, timezone
 import db
 import dexscreener_pairs as dsp
 import geckoterminal_client as gt
+import multichain_monitor as mcm
 
 DEXSCREENER_BASE = "https://api.dexscreener.com"
 WEBHOOK_PERFORMANCE = os.environ.get("DISCORD_WEBHOOK_PERFORMANCE", "")
@@ -94,13 +97,18 @@ SRC_LEGACY_ERROR = "dexscreener_error"
 # vs 45-68.5% for positive rows, i.e. overwhelmingly dead). The separate
 # marker keeps that assumption checkable.
 SRC_LEGACY_NOPAIR = "dexscreener_nopair"
-# Price taken from a pair that could not be cross-checked: fewer than
-# MIN_PAIRS_FOR_MEDIAN base-side pairs exist and none is quoted in a known
-# asset. The price is stored and DOES count as an outcome, but the marker
-# keeps it separable, because the cross-pair check is what catches DexScreener
-# pairs with a broken priceUsd (verified live 2026-09-19: RAY/JUP reported
-# 9341.32 with $147M liquidity against a true 1.88 — a ~4968x multiplier that
-# also appears on PAXG, BONK, PYTH, LIT and on migrations entry prices).
+# Price taken from a pair that could not be cross-checked. Since 2026-09-21
+# dexscreener_pairs returns this verdict in three situations: fewer than
+# MIN_PAIRS_FOR_MEDIAN voters (pairs above MIN_VOTING_LIQUIDITY_USD) and none
+# quoted in a known asset; no pair above the liquidity floor at all (the most
+# liquid pair is used); and exactly two voters disagreeing by more than
+# VOTER_DISAGREEMENT_FACTOR (the pick is kept). The price is stored and DOES
+# count as an outcome, but the marker keeps it separable, because the
+# cross-pair check is what catches DexScreener pairs with a broken priceUsd
+# (verified live 2026-09-19: RAY/JUP reported 9341.32 with $147M liquidity
+# against a true 1.88 — a ~4968x multiplier that also appears on PAXG, BONK,
+# PYTH, LIT and on migrations entry prices). The authoritative list of rules
+# is dexscreener_pairs.py; this comment only says what the marker means here.
 SRC_LEGACY_UNVERIFIED = "dexscreener_unverified"
 # Pinned pool answered, but its newest candle at or before the measurement
 # instant is older than the slot's tolerance: the pool stopped trading before
@@ -143,10 +151,16 @@ ENTRY_TOLERANCE = 900
 # fill the price column with a DexScreener reading that the pinned path can
 # then never replace (selection keys off the column being NULL).
 #
+# The multichain channels come from multichain_monitor.MEASURED_CHANNEL_CHAINS,
+# one per chain, so a chain added there is measured without a second edit.
+# They are listed LAST: the per-run row budget is spent in this order, and the
+# solana channels were here first with their own volume. Multichain adds a few
+# alerts per hour against a budget that has run at about half of its cap.
+#
 # SHARP EDGE: a channel added to the scanner later and not added here will
 # never be measured. The startup line below prints this list so the omission is
 # visible rather than silent.
-LEGACY_CHANNELS = ("jupiter", "migrations", "spikes", "alpha", "gems")
+LEGACY_CHANNELS = ("jupiter", "migrations", "spikes", "alpha", "gems") + tuple(mcm.MEASURED_CHANNEL_CHAINS)
 PINNED_CHANNEL = "robinhood"
 PINNED_NETWORK_HINT = "robinhood"
 
@@ -192,22 +206,40 @@ def _rotated_slots() -> tuple:
 
 # === Legacy path (DexScreener) ===
 
-async def _fetch_current_price(session: aiohttp.ClientSession, address: str) -> tuple[float, str]:
+def _chain_for(address: str, channel: str | None = None) -> str:
+    """
+    DexScreener chainId for a row.
+
+    A multichain channel names its chain explicitly and wins. Otherwise the
+    chain is inferred from the address format: Robinhood Chain tokens are
+    0x-prefixed EVM addresses, Solana mints are base58 (never 0x). The address
+    rule alone is wrong for any other EVM chain — it sent Base, Monad, INK,
+    HyperEVM, Plasma and Stable tokens to the robinhood endpoint, where they
+    would always read as dexscreener_nopair, i.e. -100%.
+    """
+    explicit = mcm.MEASURED_CHANNEL_CHAINS.get(channel or "")
+    if explicit:
+        return explicit
+    return "robinhood" if address.startswith("0x") else "solana"
+
+
+async def _fetch_current_price(session: aiohttp.ClientSession, address: str,
+                               channel: str | None = None) -> tuple[float, str]:
     """
     Current price from the pair chosen by dexscreener_pairs.select_base_pair
     (base-side only, cross-checked against the other pairs). Returns
     (price, source_marker).
 
-    The chain is inferred from the address format: Robinhood Chain tokens are
-    0x-prefixed EVM addresses, Solana mints are base58 (never 0x). Without this
-    split, robinhood alerts would be queried against the solana endpoint and
-    always read as dead.
+    The chain comes from _chain_for: the channel for multichain rows, the
+    address format for everything else. Without the split, robinhood alerts
+    would be queried against the solana endpoint and always read as dead, and
+    multichain alerts against the robinhood endpoint, with the same result.
 
     Outcomes, deliberately kept apart:
       (price, SRC_LEGACY)          a base-side pair priced the token, agreeing
                                    with the median of the other pairs
-      (price, SRC_LEGACY_UNVERIFIED) too few pairs to cross-check and no known
-                                   quote asset: stored, still an outcome
+      (price, SRC_LEGACY_UNVERIFIED) the pick could not be cross-checked (see
+                                   the marker's comment): stored, still an outcome
       (0.0, SRC_LEGACY_NOPAIR)     valid response, no liquid base-side pair:
                                    treated as a dead token (-100%)
       (0.0, SRC_LEGACY_ERROR)      request or payload failure: NOT an outcome
@@ -216,7 +248,7 @@ async def _fetch_current_price(session: aiohttp.ClientSession, address: str) -> 
     dexscreener_pairs.py, which pumpportal_client shares — the migration entry
     price had the same defect and must stay consistent with this one.
     """
-    chain = "robinhood" if address.startswith("0x") else "solana"
+    chain = _chain_for(address, channel)
     url = f"{DEXSCREENER_BASE}/token-pairs/v1/{chain}/{address}"
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
@@ -535,7 +567,7 @@ async def track_performance(session: aiohttp.ClientSession):
                 if not legacy_rows.take():
                     break
                 await asyncio.sleep(REQUEST_DELAY)
-                price, source = await _fetch_current_price(session, row["address"])
+                price, source = await _fetch_current_price(session, row["address"], channel)
                 db.set_measurement(row["id"], column, price, source)
                 legacy_sources[source] = legacy_sources.get(source, 0) + 1
                 measured += 1
