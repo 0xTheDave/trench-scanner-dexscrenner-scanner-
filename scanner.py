@@ -9,6 +9,7 @@ import os
 from datetime import datetime, timezone
 
 import db
+import dexscreener_pairs as dsp
 from filters import FILTERS
 from state import SeenTokens, VolumeHistory
 from discord_client import (
@@ -83,6 +84,39 @@ def _price_of(pair: dict) -> float:
         return float(pair.get("priceUsd") or 0)
     except (ValueError, TypeError):
         return 0.0
+
+
+def _pick_pair(pairs_data, addr: str) -> dict | None:
+    """
+    The pair that describes `addr`: the most liquid pair where `addr` is the
+    BASE token. That pair drives the filters, the score, the alert embed
+    (symbol, price, mcap), the watchlist snapshot and price_at_alert.
+
+    /token-pairs/v1 also returns pairs where the token is the QUOTE side, and
+    such a pair describes a different asset entirely — the alert would show
+    another token's symbol and price. The previous rule took the most liquid
+    pair of any side.
+
+    Deliberately NOT dexscreener_pairs.select_base_pair (2026-09-22). On 150
+    alpha/gems/spikes tokens the two rules agreed on 147, found no quote-side
+    pick, and differed on 2: one at a 1.03x price ratio, and one (Nipple,
+    EYXnJnQS...) where select_base_pair's trusted-quote preference picks a
+    $1,193 SOL pool with a price frozen since 2026-09-21 over the live $10.8k
+    wXRP pool that the most-liquid rule picks. For this channel mix the
+    base-side filter removes the wrong-asset case without taking on that
+    known limitation. Revisit if the probe (audit/probe_scanner_pair_choice.py)
+    starts showing inflated-liquidity picks here.
+    """
+    if not isinstance(pairs_data, list):
+        return None
+    valid = [
+        p for p in pairs_data
+        if isinstance(p, dict) and p.get("liquidity")
+        and dsp.same_address((p.get("baseToken") or {}).get("address"), addr)
+    ]
+    if not valid:
+        return None
+    return max(valid, key=lambda x: dsp.as_float((x.get("liquidity") or {}).get("usd")) or 0.0)
 
 
 async def fetch_json(session: aiohttp.ClientSession, url: str) -> dict | list | None:
@@ -286,12 +320,10 @@ async def process_profile(
         seen.add(addr)
         return
 
-    valid_pairs = [p for p in pairs_data if p.get("liquidity")]
-    if not valid_pairs:
+    pair = _pick_pair(pairs_data, addr)
+    if not pair:
         seen.add(addr)
         return
-
-    pair = max(valid_pairs, key=lambda x: x.get("liquidity", {}).get("usd", 0))
 
     created_at = pair.get("pairCreatedAt")
     age_hours = (time.time() - created_at / 1000) / 3600 if created_at else 999
@@ -445,11 +477,9 @@ async def scan_watchlist(session: aiohttp.ClientSession):
         if not pairs_data:
             continue
 
-        valid_pairs = [p for p in pairs_data if p.get("liquidity")]
-        if not valid_pairs:
+        pair = _pick_pair(pairs_data, addr)
+        if not pair:
             continue
-
-        pair = max(valid_pairs, key=lambda x: x.get("liquidity", {}).get("usd", 0))
 
         vol_m5 = (pair.get("volume") or {}).get("m5") or 0
         vol_h1 = (pair.get("volume") or {}).get("h1") or 0
